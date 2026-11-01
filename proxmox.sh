@@ -32,7 +32,7 @@ CONTAINERS=(
 
 # role -> "script_name|Service Name|port" entries
 declare -A ROLE_SCRIPTS=(
-  [docker]="immich-install.sh|Immich|2283 nextcloud-install.sh|Nextcloud|8080 romm-install.sh|RomM|8081 npm-install.sh|Nginx Proxy Manager|81"
+  [docker]="immich-install.sh|Immich|2283 nextcloud-install.sh|Nextcloud|8080 romm-install.sh|RomM|8081 npm-install.sh|NginxProxyManager|81"
   [source]="jellyfin-install.sh|Jellyfin|8096 navidrome-install.sh|Navidrome|4533 filebrowser-install.sh|FileBrowser|8082 adguard-install.sh|AdGuard Home|3000"
   [light]="vaultwarden-install.sh|Vaultwarden|8000 trilium-install.sh|Trilium|8083"
   [forge]="forgepanel-install.sh|ForgePanel|8084"
@@ -94,7 +94,7 @@ setup_ct() {
       info "Installing Docker in CT $ctid..."
       pct exec "$ctid" -- bash -c '
         apt-get update -qq
-        apt-get install -y ca-certificates curl openssh-server
+        apt-get install -y sudo ca-certificates curl openssh-server
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
@@ -110,7 +110,7 @@ setup_ct() {
       info "Installing build tools in CT $ctid..."
       pct exec "$ctid" -- bash -c '
         apt-get update -qq
-        apt-get install -y git curl ca-certificates tar gcc g++ make nodejs npm golang openssh-server
+        apt-get install -y sudo git curl ca-certificates tar gcc g++ make nodejs npm golang openssh-server
         systemctl enable --now ssh
       '
       ok "Build tools ready in CT $ctid"
@@ -119,7 +119,7 @@ setup_ct() {
       info "Installing base tools in CT $ctid..."
       pct exec "$ctid" -- bash -c '
         apt-get update -qq
-        apt-get install -y git curl ca-certificates tar xz-utils openssh-server
+        apt-get install -y sudo git curl ca-certificates tar xz-utils openssh-server
         systemctl enable --now ssh
       '
       ok "Base tools ready in CT $ctid"
@@ -128,7 +128,7 @@ setup_ct() {
       info "Installing base tools in CT $ctid..."
       pct exec "$ctid" -- bash -c '
         apt-get update -qq
-        apt-get install -y python3 git openssh-server
+        apt-get install -y sudo python3 git openssh-server
         systemctl enable --now ssh
       '
       ok "Base tools ready in CT $ctid"
