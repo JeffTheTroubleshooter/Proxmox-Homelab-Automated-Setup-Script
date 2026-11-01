@@ -190,6 +190,197 @@ extract_script() {
   chmod +x "$dest"
 }
 
+
+# Build from-source services on the Proxmox host (all cores), then deploy.
+BUILD_ROOT="/root/homelab-builds"
+
+host_deps() {
+  info "Installing host build tools..."
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    git curl ca-certificates tar gcc g++ make pkg-config \
+    nodejs npm golang build-essential libssl-dev libsqlite3-dev || true
+  if ! command -v cargo >/dev/null 2>&1; then
+    info "Installing Rust on the host..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  fi
+  # shellcheck disable=SC1091
+  [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+  ok "Host build tools ready."
+}
+
+build_on_host() {
+  host_deps
+  mkdir -p "$BUILD_ROOT"
+
+  # Navidrome
+  if [[ ! -x "$BUILD_ROOT/navidrome/navidrome" ]]; then
+    info "Building Navidrome on the host..."
+    rm -rf "$BUILD_ROOT/navidrome-src"
+    git clone --depth 1 https://github.com/navidrome/navidrome.git "$BUILD_ROOT/navidrome-src"
+    (cd "$BUILD_ROOT/navidrome-src" && make setup && make build) || warn "Navidrome host build failed"
+    mkdir -p "$BUILD_ROOT/navidrome"
+    cp "$BUILD_ROOT/navidrome-src/navidrome" "$BUILD_ROOT/navidrome/" 2>/dev/null || true
+  fi
+
+  # FileBrowser
+  if [[ ! -x "$BUILD_ROOT/filebrowser/filebrowser" ]]; then
+    info "Building FileBrowser on the host..."
+    rm -rf "$BUILD_ROOT/filebrowser-src"
+    git clone --depth 1 https://github.com/filebrowser/filebrowser.git "$BUILD_ROOT/filebrowser-src"
+    (cd "$BUILD_ROOT/filebrowser-src" && go build -o filebrowser .) || warn "FileBrowser host build failed"
+    mkdir -p "$BUILD_ROOT/filebrowser"
+    cp "$BUILD_ROOT/filebrowser-src/filebrowser" "$BUILD_ROOT/filebrowser/" 2>/dev/null || true
+  fi
+
+  # AdGuard
+  if [[ ! -x "$BUILD_ROOT/adguard/AdGuardHome" ]]; then
+    info "Building AdGuard Home on the host..."
+    rm -rf "$BUILD_ROOT/adguard-src"
+    git clone https://github.com/AdguardTeam/AdGuardHome.git "$BUILD_ROOT/adguard-src"
+    (cd "$BUILD_ROOT/adguard-src" && make) || warn "AdGuard host build failed"
+    mkdir -p "$BUILD_ROOT/adguard"
+    cp "$BUILD_ROOT/adguard-src/AdGuardHome" "$BUILD_ROOT/adguard/" 2>/dev/null || true
+  fi
+
+  # Vaultwarden
+  if [[ ! -x "$BUILD_ROOT/vaultwarden/vaultwarden" ]]; then
+    info "Building Vaultwarden on the host..."
+    # shellcheck disable=SC1091
+    [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+    rm -rf "$BUILD_ROOT/vaultwarden-src"
+    git clone --depth 1 https://github.com/dani-garcia/vaultwarden.git "$BUILD_ROOT/vaultwarden-src"
+    (cd "$BUILD_ROOT/vaultwarden-src" && cargo build --features sqlite --release) || warn "Vaultwarden host build failed"
+    mkdir -p "$BUILD_ROOT/vaultwarden"
+    cp "$BUILD_ROOT/vaultwarden-src/target/release/vaultwarden" "$BUILD_ROOT/vaultwarden/" 2>/dev/null || true
+  fi
+
+  ok "Host builds finished."
+}
+
+# Deploy a host-built binary into a container and start it. Returns 0 if handled.
+deploy_built() {
+  local ctid="$1" script="$2"
+  case "$script" in
+    navidrome-install.sh)
+      [[ -x "$BUILD_ROOT/navidrome/navidrome" ]] || return 1
+      info "Deploying Navidrome into CT $ctid"
+      pct exec "$ctid" -- mkdir -p /opt/navidrome /mnt/music
+      pct push "$ctid" "$BUILD_ROOT/navidrome/navidrome" /opt/navidrome/navidrome
+      pct exec "$ctid" -- bash -c '
+        chmod +x /opt/navidrome/navidrome
+        cat >/opt/navidrome/navidrome.toml <<C
+MusicFolder = "/mnt/music"
+DataFolder = "/opt/navidrome/data"
+Port = 4533
+Address = "0.0.0.0"
+C
+        cat >/etc/systemd/system/navidrome.service <<U
+[Unit]
+Description=Navidrome
+After=network.target
+[Service]
+Type=simple
+ExecStart=/opt/navidrome/navidrome --configfile /opt/navidrome/navidrome.toml
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+U
+        systemctl daemon-reload
+        systemctl enable --now navidrome
+      '
+      ok "Navidrome deployed"
+      return 0
+      ;;
+    filebrowser-install.sh)
+      [[ -x "$BUILD_ROOT/filebrowser/filebrowser" ]] || return 1
+      info "Deploying FileBrowser into CT $ctid"
+      pct exec "$ctid" -- mkdir -p /opt/filebrowser /srv/files
+      pct push "$ctid" "$BUILD_ROOT/filebrowser/filebrowser" /usr/local/bin/filebrowser
+      pct exec "$ctid" -- bash -c '
+        chmod +x /usr/local/bin/filebrowser
+        (cd /opt/filebrowser && /usr/local/bin/filebrowser config init || true)
+        (cd /opt/filebrowser && /usr/local/bin/filebrowser users add admin admin12345678 --perm.admin || true)
+        cat >/etc/systemd/system/filebrowser.service <<U
+[Unit]
+Description=FileBrowser
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/filebrowser
+ExecStart=/usr/local/bin/filebrowser -d /opt/filebrowser/filebrowser.db -r /srv/files -a 0.0.0.0 -p 8082
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+U
+        systemctl daemon-reload
+        systemctl enable --now filebrowser
+      '
+      ok "FileBrowser deployed"
+      return 0
+      ;;
+    adguard-install.sh)
+      [[ -x "$BUILD_ROOT/adguard/AdGuardHome" ]] || return 1
+      info "Deploying AdGuard Home into CT $ctid"
+      pct exec "$ctid" -- mkdir -p /opt/adguardhome
+      pct push "$ctid" "$BUILD_ROOT/adguard/AdGuardHome" /usr/local/bin/AdGuardHome
+      pct exec "$ctid" -- bash -c '
+        chmod +x /usr/local/bin/AdGuardHome
+        cat >/etc/systemd/system/adguardhome.service <<U
+[Unit]
+Description=AdGuard Home
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/adguardhome
+ExecStart=/usr/local/bin/AdGuardHome -w /opt/adguardhome --no-check-update
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+U
+        systemctl daemon-reload
+        systemctl enable --now adguardhome
+      '
+      ok "AdGuard deployed"
+      return 0
+      ;;
+    vaultwarden-install.sh)
+      [[ -x "$BUILD_ROOT/vaultwarden/vaultwarden" ]] || return 1
+      info "Deploying Vaultwarden into CT $ctid"
+      pct exec "$ctid" -- mkdir -p /opt/vaultwarden/data
+      pct push "$ctid" "$BUILD_ROOT/vaultwarden/vaultwarden" /opt/vaultwarden/vaultwarden
+      pct exec "$ctid" -- bash -c '
+        chmod +x /opt/vaultwarden/vaultwarden
+        cat >/opt/vaultwarden/vaultwarden.env <<E
+DATA_FOLDER=/opt/vaultwarden/data
+ROCKET_ADDRESS=0.0.0.0
+ROCKET_PORT=8000
+SIGNUPS_ALLOWED=true
+E
+        cat >/etc/systemd/system/vaultwarden.service <<U
+[Unit]
+Description=Vaultwarden
+After=network.target
+[Service]
+Type=simple
+EnvironmentFile=/opt/vaultwarden/vaultwarden.env
+ExecStart=/opt/vaultwarden/vaultwarden
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+U
+        systemctl daemon-reload
+        systemctl enable --now vaultwarden
+      '
+      ok "Vaultwarden deployed"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 lock_down() {
   local ctid="$1"
   info "Removing SSH from CT $ctid..."
@@ -225,10 +416,12 @@ copy_and_run_scripts() {
     extract_script "$script" "$src"
     scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$src" "root@$ip:$dest/$script" || { warn "Failed to copy $script"; continue; }
+    if deploy_built "$ctid" "$script"; then
+      continue
+    fi
     info "Running $script on $ip ..."
     # Feed a fixed set of newlines so prompts take defaults.
     # Stream output live so it does not look stuck.
-    # No infinite yes, no timeout — same as running the script yourself.
     printf '\n%.0s' {1..30} | ssh -i /root/.ssh/homelab_key \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "root@$ip" "chmod +x $dest/$script && cd $dest && ./$script" || \
@@ -468,6 +661,8 @@ main() {
         new_list+=("$ctid|$hostname|$cores|$memory|$disk|$role|$cpulimit")
       done
       CONTAINERS=("${new_list[@]}")
+
+      build_on_host
 
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"

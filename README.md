@@ -31,11 +31,12 @@ On a normal run the script also checks GitHub for a newer copy of itself and off
 ## What happens during a run
 
 1. Downloads the newest Debian 12 LXC template.
-2. Creates each container with its CPU limit, memory, swap and disk settings.
-3. Installs the role's base packages (Docker, build tools, Python, etc.).
-4. Copies the service installer scripts into the container over SSH and runs each one with its prompts on defaults.
-5. Removes SSH from the container and stops it once the installs finish.
-6. Creates the TrueNAS VM, then starts all containers again.
+2. Installs build tools on the Proxmox host (Go, Node, Rust, gcc) and builds the source-based services there — Navidrome, FileBrowser, AdGuard Home and Vaultwarden — into `/root/homelab-builds`. Building on the host uses every core instead of a container's CPU limit.
+3. Creates each container with its CPU limit, memory, swap and disk settings.
+4. Installs the role's base packages (Docker, build tools, Python, etc.).
+5. Pushes the host-built binaries into their container and installs them as systemd services; anything not built on the host gets its installer script copied in over SSH and run with its prompts on defaults.
+6. Removes SSH from the container and stops it once the installs finish.
+7. Creates the TrueNAS VM, then starts all containers again.
 
 ## Security note
 
@@ -45,5 +46,7 @@ The containers use a default root password (`admin`) set at the top of the scrip
 pct enter <ctid>
 passwd
 ```
+
+Services built on the host are deployed as root with their default app credentials (for example FileBrowser `admin` / `admin12345678`). Change those on first login.
 
 SSH is only enabled inside each container while the installers run, then it is removed and the container's root SSH key is deleted.
