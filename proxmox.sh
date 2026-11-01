@@ -18,16 +18,28 @@
 set -euo pipefail
 
 START_TIME=$(date +%s)
-PASSWORD="homelab"
+PASSWORD="admin"
+TRUENAS_ISO_URL="https://download.sys.truenas.net/TrueNAS-SCALE-Goldeye/25.10.7/TrueNAS-SCALE-25.10.7.iso"
+TRUENAS_ISO="TrueNAS-SCALE-25.10.7.iso"
+TRUENAS_VMID=100
+
+# Return the first free ID at or above $1.
+next_free_id() {
+  local id="$1"
+  while pct status "$id" >/dev/null 2>&1 || qm status "$id" >/dev/null 2>&1; do
+    id=$((id + 1))
+  done
+  printf '%s' "$id"
+}
 BRIDGE="vmbr0"
 STORAGE="local-lvm"
 TEMPLATE=""
 
 CONTAINERS=(
-  "200|docker-stack|2|2048|16|docker"
-  "201|source-stack|2|4096|12|source"
-  "202|light-stack|1|1024|8|light"
-  "203|forgepanel|1|512|4|forge"
+  "200|docker-stack|2|1536|20|docker|2"
+  "201|source-stack|4|3072|16|source|4"
+  "202|light-stack|1|768|8|light|1"
+  "203|forgepanel|1|384|4|forge|1"
 )
 
 # role -> "script_name|Service Name|port" entries
@@ -67,16 +79,20 @@ ensure_template() {
 }
 
 create_ct() {
-  local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5"
+  local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5" cpulimit="$6"
   if pct status "$ctid" >/dev/null 2>&1; then
-    warn "CT $ctid already exists — skipping create."
+    warn "CT $ctid already exists — updating limits."
+    pct set "$ctid" --cores "$cores" --memory "$memory" --cpulimit "$cpulimit" || true
     return 0
   fi
-  info "Creating CT $ctid ($hostname)..."
+  info "Creating CT $ctid ($hostname) — ${cores} cores, ${memory}MB, cpulimit ${cpulimit}"
   pct create "$ctid" "$TEMPLATE" \
     --hostname "$hostname" \
     --cores "$cores" \
     --memory "$memory" \
+    --swap 256 \
+    --cpulimit "$cpulimit" \
+    --cpuunits 1024 \
     --rootfs "${STORAGE}:${disk}" \
     --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
     --password "$PASSWORD" \
@@ -174,6 +190,21 @@ extract_script() {
   chmod +x "$dest"
 }
 
+lock_down() {
+  local ctid="$1"
+  info "Removing SSH from CT $ctid..."
+  pct exec "$ctid" -- bash -c '
+    systemctl disable --now ssh 2>/dev/null || true
+    systemctl disable --now sshd 2>/dev/null || true
+    rm -rf /root/.ssh
+    apt-get remove -y openssh-server 2>/dev/null || true
+  ' || true
+  ok "SSH removed from CT $ctid"
+  info "Stopping CT $ctid..."
+  pct stop "$ctid" || true
+  ok "CT $ctid stopped."
+}
+
 copy_and_run_scripts() {
   local ctid="$1" role="$2"
   local dest="/root/scripts"
@@ -194,13 +225,43 @@ copy_and_run_scripts() {
     extract_script "$script" "$src"
     scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$src" "root@$ip:$dest/$script" || { warn "Failed to copy $script"; continue; }
-    info "Running $script on $ip (accepting defaults)..."
-    ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "root@$ip" "chmod +x $dest/$script && cd $dest && export NODE_OPTIONS=--max-old-space-size=3072 && yes \"\" | ./$script" || \
+    info "Running $script on $ip ..."
+    # Feed a fixed set of newlines so prompts take defaults.
+    # Stream output live so it does not look stuck.
+    # No infinite yes, no timeout — same as running the script yourself.
+    printf '\n%.0s' {1..30} | ssh -i /root/.ssh/homelab_key \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "root@$ip" "chmod +x $dest/$script && cd $dest && ./$script" || \
       warn "$script exited with an error on $ip"
   done
   rm -rf "$tmpdir"
   ok "Services installed on CT $ctid ($ip)"
+}
+
+setup_truenas() {
+  info "Downloading TrueNAS SCALE ISO..."
+  local iso_dir="/var/lib/vz/template/iso"
+  mkdir -p "$iso_dir"
+  if [[ ! -f "$iso_dir/$TRUENAS_ISO" ]]; then
+    curl -fL --progress-bar -o "$iso_dir/$TRUENAS_ISO" "$TRUENAS_ISO_URL" || die "TrueNAS ISO download failed"
+  fi
+  ok "ISO ready: $iso_dir/$TRUENAS_ISO"
+
+  if qm status "$TRUENAS_VMID" >/dev/null 2>&1 || pct status "$TRUENAS_VMID" >/dev/null 2>&1; then
+    local free
+    free=$(next_free_id "$TRUENAS_VMID")
+    warn "VM ID $TRUENAS_VMID is taken — using $free for TrueNAS"
+    TRUENAS_VMID="$free"
+  fi
+
+  info "Creating TrueNAS VM $TRUENAS_VMID..."
+  qm create "$TRUENAS_VMID" --name truenas --memory 4096 --cores 2 --cpu host \
+    --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26
+  qm set "$TRUENAS_VMID" --scsi0 "${STORAGE}:32"
+  qm set "$TRUENAS_VMID" --ide2 "local:iso/${TRUENAS_ISO},media=cdrom"
+  qm set "$TRUENAS_VMID" --boot order=ide2
+  qm set "$TRUENAS_VMID" --serial0 socket --vga serial0
+  ok "TrueNAS VM created. Start it from the Proxmox console to install."
 }
 
 print_summary() {
@@ -244,9 +305,13 @@ print_summary() {
     echo
   done
 
-  echo "Container password: $PASSWORD"
-  echo "Enter a container:  pct enter <ctid>"
-  echo "SSH into one:       ssh -i /root/.ssh/homelab_key root@<ip>"
+  echo "TrueNAS VM:  $TRUENAS_VMID (ISO attached, start it to install)"
+  echo "  qm start $TRUENAS_VMID"
+  echo
+  echo "Default password for every container: $PASSWORD"
+  echo "CHANGE THIS PASSWORD on each container once the script is done."
+  echo "  pct enter <ctid>"
+  echo "  passwd"
   echo
   echo "Add these URLs to ForgePanel so you can click through to each service."
   echo
@@ -330,18 +395,30 @@ destroy_all() {
   for entry in "${CONTAINERS[@]}"; do
     IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
     if pct status "$ctid" >/dev/null 2>&1; then
+      # clear a stuck lock before doing anything
+      info "Unlocking CT $ctid if locked..."
+      pct unlock "$ctid" 2>/dev/null || true
+      rm -f "/run/lock/lxc/pve-config-${ctid}.lock" "/var/lock/lxc/pve-config-${ctid}.lock" 2>/dev/null || true
       # make sure it is running so we can remove packages
       pct start "$ctid" >/dev/null 2>&1 || true
       sleep 2
       remove_packages_in_ct "$ctid" "$role"
       info "Removing CT $ctid ($hostname)..."
-      pct stop "$ctid" 2>/dev/null || true
-      pct destroy "$ctid" || true
+      pct unlock "$ctid" 2>/dev/null || true
+      pct stop "$ctid" --skiplock 2>/dev/null || pct stop "$ctid" 2>/dev/null || true
+      pct destroy "$ctid" --force 2>/dev/null || pct destroy "$ctid" || true
       ok "CT $ctid removed."
     else
       warn "CT $ctid not found."
     fi
   done
+
+  if qm status "$TRUENAS_VMID" >/dev/null 2>&1; then
+    info "Removing TrueNAS VM $TRUENAS_VMID..."
+    qm stop "$TRUENAS_VMID" 2>/dev/null || true
+    qm destroy "$TRUENAS_VMID" || true
+    ok "TrueNAS VM removed."
+  fi
 
   # host-side leftovers
   if [[ -f /root/.ssh/homelab_key ]]; then
@@ -370,12 +447,42 @@ main() {
       echo "=============================="
       check_host
       ensure_template
+
+      # Assign free IDs if the defaults are taken
+      local -a assigned=()
+      local new_list=()
       for entry in "${CONTAINERS[@]}"; do
-        IFS='|' read -r ctid hostname cores memory disk role <<< "$entry"
-        create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk"
+        IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
+        if pct status "$ctid" >/dev/null 2>&1 || qm status "$ctid" >/dev/null 2>&1; then
+          local free
+          free=$(next_free_id "$ctid")
+          # also skip IDs we just assigned in this run
+          while printf '%s\n' "${assigned[@]}" | grep -qx "$free"; do
+            free=$((free + 1))
+            free=$(next_free_id "$free")
+          done
+          warn "ID $ctid is taken — using $free for $hostname"
+          ctid="$free"
+        fi
+        assigned+=("$ctid")
+        new_list+=("$ctid|$hostname|$cores|$memory|$disk|$role|$cpulimit")
+      done
+      CONTAINERS=("${new_list[@]}")
+
+      for entry in "${CONTAINERS[@]}"; do
+        IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
+        create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit"
         setup_ct "$ctid" "$role"
         copy_and_run_scripts "$ctid" "$role"
+        lock_down "$ctid"
       done
+      setup_truenas
+      info "Starting all containers (SSH stays off)..."
+      for entry in "${CONTAINERS[@]}"; do
+        IFS='|' read -r ctid hostname _ _ _ _ _ <<< "$entry"
+        pct start "$ctid" || true
+      done
+      sleep 5
       print_summary
       ;;
     *)
