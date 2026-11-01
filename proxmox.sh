@@ -112,6 +112,56 @@ create_ct() {
   ok "CT $ctid created."
 }
 
+create_docker_vm() {
+  local vmid="$1" hostname="$2" cores="$3" memory="$4" disk="$5"
+  local img_dir="/var/lib/vz/template/qcow2"
+  local img="$img_dir/debian-12-generic-amd64.qcow2"
+  local img_url="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+
+  if qm status "$vmid" >/dev/null 2>&1; then
+    warn "Docker VM $vmid already exists"
+    return 0
+  fi
+
+  mkdir -p "$img_dir" /root/.ssh
+  if [[ ! -f /root/.ssh/homelab_key ]]; then
+    ssh-keygen -t ed25519 -f /root/.ssh/homelab_key -N "" -q
+  fi
+  if [[ ! -f "$img" ]]; then
+    info "Downloading Debian 12 cloud image..."
+    curl -fL --progress-bar -o "$img" "$img_url" || die "Debian cloud image download failed"
+  fi
+
+  info "Creating Docker VM $vmid ($hostname) — real VM, not LXC"
+  qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" \
+    --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26 \
+    --agent enabled=1 --serial0 socket --vga serial0
+  qm importdisk "$vmid" "$img" "$STORAGE"
+  qm set "$vmid" --scsi0 "${STORAGE}:vm-${vmid}-disk-0" --boot order=scsi0
+  qm set "$vmid" --ide2 "${STORAGE}:cloudinit"
+  qm set "$vmid" --ciuser root --cipassword "$PASSWORD" --sshkeys /root/.ssh/homelab_key.pub
+  qm set "$vmid" --ipconfig0 ip=dhcp
+  qm resize "$vmid" scsi0 "${disk}G"
+  qm start "$vmid"
+  ok "Docker VM $vmid started"
+}
+
+wait_for_vm() {
+  local vmid="$1" ip="" i
+  info "Waiting for Docker VM $vmid to get an IP..."
+  for i in $(seq 1 60); do
+    ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
+      | grep -oE '"ip-address" : "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' \
+      | grep -v '127.0.0.1' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+    if [[ -n "$ip" ]]; then
+      printf '%s' "$ip"
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
 setup_ct() {
   local ctid="$1" role="$2"
   info "Starting CT $ctid..."
@@ -597,6 +647,13 @@ destroy_all() {
   check_host
   for entry in "${CONTAINERS[@]}"; do
     IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
+    if [[ "$role" == "docker" ]] && qm status "$ctid" >/dev/null 2>&1; then
+      info "Removing Docker VM $ctid..."
+      qm stop "$ctid" 2>/dev/null || true
+      qm destroy "$ctid" --purge || true
+      ok "Docker VM $ctid removed."
+      continue
+    fi
     if pct status "$ctid" >/dev/null 2>&1; then
       # clear a stuck lock before doing anything
       info "Unlocking CT $ctid if locked..."
@@ -676,18 +733,43 @@ main() {
 
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
-        local privileged=0
-        [[ "$role" == "docker" ]] && privileged=1
-        create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" "$privileged"
-        setup_ct "$ctid" "$role"
-        copy_and_run_scripts "$ctid" "$role"
-        lock_down "$ctid"
+        if [[ "$role" == "docker" ]]; then
+          create_docker_vm "$ctid" "$hostname" "$cores" "$memory" "$disk"
+          local vmip
+          vmip=$(wait_for_vm "$ctid") || die "Docker VM $ctid did not get an IP"
+          info "Docker VM is at $vmip"
+          # install docker and run the compose scripts over SSH
+          ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null             "root@$vmip" "apt-get update -qq && apt-get install -y ca-certificates curl &&             install -m 0755 -d /etc/apt/keyrings &&             curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc &&             chmod a+r /etc/apt/keyrings/docker.asc &&             echo deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable > /etc/apt/sources.list.d/docker.list &&             apt-get update -qq && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin &&             systemctl enable --now docker && mkdir -p /root/scripts"
+          local tmpdir entry script svc port src
+          tmpdir=$(mktemp -d)
+          for entry in ${ROLE_SCRIPTS[$role]}; do
+            IFS="|" read -r script svc port <<< "$entry"
+            src="$tmpdir/$script"
+            extract_script "$script" "$src"
+            scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null               "$src" "root@$vmip:/root/scripts/$script"
+            info "Running $script on Docker VM $vmip"
+            printf "\n%.0s" {1..30} | ssh -i /root/.ssh/homelab_key               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null               "root@$vmip" "chmod +x /root/scripts/$script && cd /root/scripts && ./$script" ||               warn "$script failed on Docker VM"
+          done
+          rm -rf "$tmpdir"
+          # remove SSH when done
+          ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null             "root@$vmip" "systemctl disable --now ssh; apt-get remove -y openssh-server" || true
+          qm shutdown "$ctid" || true
+        else
+          create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 0
+          setup_ct "$ctid" "$role"
+          copy_and_run_scripts "$ctid" "$role"
+          lock_down "$ctid"
+        fi
       done
       setup_truenas
-      info "Starting all containers (SSH stays off)..."
+      info "Starting all containers and the Docker VM (SSH stays off)..."
       for entry in "${CONTAINERS[@]}"; do
-        IFS='|' read -r ctid hostname _ _ _ _ _ <<< "$entry"
-        pct start "$ctid" || true
+        IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
+        if [[ "$role" == "docker" ]]; then
+          qm start "$ctid" || true
+        else
+          pct start "$ctid" || true
+        fi
       done
       sleep 5
       print_summary
