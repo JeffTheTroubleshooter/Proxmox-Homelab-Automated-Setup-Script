@@ -13,6 +13,8 @@ One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, i
 
 A **TrueNAS SCALE VM** (ID 100, 4 GB RAM, 2 cores) is also created with the installer ISO attached. The script does not install TrueNAS for you: start the VM and walk through the installer in the Proxmox console.
 
+The `docker-stack` container is created **privileged** (`nesting=1,keyctl=1,fuse=1`) so Docker can use `overlay2`. In an unprivileged container Docker falls back to `fuse-overlayfs`, which unpacks image layers very slowly. The other three containers are unprivileged.
+
 ## Usage
 
 On the Proxmox host, as root:
@@ -50,3 +52,5 @@ passwd
 Services built on the host are deployed as root with their default app credentials (for example FileBrowser `admin` / `admin12345678`). Change those on first login.
 
 SSH is only enabled inside each container while the installers run, then it is removed and the container's root SSH key is deleted.
+
+Because the Docker container is privileged, services running in it have more access to the host than a normal container. It is the container that faces the most exposure (Immich, Nextcloud, RomM, Nginx Proxy Manager), so keep those services patched and do not expose them to the internet without a reverse proxy and authentication.

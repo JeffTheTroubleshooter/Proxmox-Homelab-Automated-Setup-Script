@@ -79,13 +79,23 @@ ensure_template() {
 }
 
 create_ct() {
-  local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5" cpulimit="$6"
+  local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5" cpulimit="$6" privileged="${7:-0}"
   if pct status "$ctid" >/dev/null 2>&1; then
     warn "CT $ctid already exists — updating limits."
     pct set "$ctid" --cores "$cores" --memory "$memory" --cpulimit "$cpulimit" || true
     return 0
   fi
-  info "Creating CT $ctid ($hostname) — ${cores} cores, ${memory}MB, cpulimit ${cpulimit}"
+  # Docker in an unprivileged container falls back to fuse-overlayfs and
+  # extracts layers a few hundred bytes at a time. The docker container
+  # is privileged so Docker can use overlay2 at normal speed.
+  local unpriv=1 features="nesting=1"
+  if [[ "$privileged" == "1" ]]; then
+    unpriv=0
+    features="nesting=1,keyctl=1,fuse=1"
+    info "Creating privileged CT $ctid ($hostname) for Docker"
+  else
+    info "Creating CT $ctid ($hostname) — ${cores} cores, ${memory}MB"
+  fi
   pct create "$ctid" "$TEMPLATE" \
     --hostname "$hostname" \
     --cores "$cores" \
@@ -96,8 +106,8 @@ create_ct() {
     --rootfs "${STORAGE}:${disk}" \
     --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
     --password "$PASSWORD" \
-    --unprivileged 1 \
-    --features nesting=1 \
+    --unprivileged "$unpriv" \
+    --features "$features" \
     --onboot 1
   ok "CT $ctid created."
 }
@@ -666,7 +676,9 @@ main() {
 
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
-        create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit"
+        local privileged=0
+        [[ "$role" == "docker" ]] && privileged=1
+        create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" "$privileged"
         setup_ct "$ctid" "$role"
         copy_and_run_scripts "$ctid" "$role"
         lock_down "$ctid"
