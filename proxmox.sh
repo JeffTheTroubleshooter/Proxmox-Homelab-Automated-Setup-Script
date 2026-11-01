@@ -709,7 +709,41 @@ destroy_all() {
     ok "Removed host SSH key."
   fi
 
-  ok "Done. Containers and installed packages removed."
+  # host build packages — only if the user wants them gone
+  echo
+  echo "The script installed build tools on this Proxmox host to compile binaries:"
+  echo "  git gcc g++ make pkg-config golang build-essential libssl-dev libsqlite3-dev nodejs rust"
+  echo "These are only needed to build. Once the binaries are copied into containers you can remove them."
+  read -r -p "Remove those host build packages? [y/N]: " ans
+  if [[ "${ans,,}" == "y" ]]; then
+    info "Removing host build packages..."
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y \
+      golang build-essential gcc g++ make pkg-config libssl-dev libsqlite3-dev nodejs \
+      >/dev/null 2>&1 || true
+    # rustup installs outside apt
+    if [[ -x "$HOME/.cargo/bin/rustup" ]]; then
+      "$HOME/.cargo/bin/rustup" self uninstall -y >/dev/null 2>&1 || true
+      rm -rf "$HOME/.cargo" "$HOME/.rustup"
+    fi
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    ok "Host build packages removed."
+  else
+    info "Leaving host build packages installed."
+  fi
+
+  read -r -p "Remove the host build directory $BUILD_ROOT? [y/N]: " ans
+  if [[ "${ans,,}" == "y" ]]; then
+    rm -rf "$BUILD_ROOT"
+    ok "Removed $BUILD_ROOT"
+  fi
+
+  read -r -p "Remove downloaded ISOs (Ubuntu, TrueNAS) from /var/lib/vz/template/iso? [y/N]: " ans
+  if [[ "${ans,,}" == "y" ]]; then
+    rm -f "/var/lib/vz/template/iso/$UBUNTU_ISO" "/var/lib/vz/template/iso/$TRUENAS_ISO"
+    ok "ISOs removed."
+  fi
+
+  ok "Done. Containers, VM, and chosen host leftovers removed."
 }
 
 main() {
