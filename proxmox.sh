@@ -259,7 +259,20 @@ host_deps() {
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git curl ca-certificates tar gcc g++ make pkg-config \
-    nodejs npm golang build-essential libssl-dev libsqlite3-dev || true
+    golang build-essential libssl-dev libsqlite3-dev || true
+
+  # Navidrome requires Node 24+. Debian's nodejs is too old.
+  local node_major=0
+  if command -v node >/dev/null 2>&1; then
+    node_major=$(node -v | sed 's/v//' | cut -d. -f1)
+  fi
+  if (( node_major < 24 )); then
+    info "Installing Node 24 on the host (required by Navidrome)..."
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+  fi
+  ok "Node $(node -v)"
+
   if ! command -v cargo >/dev/null 2>&1; then
     info "Installing Rust on the host..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
