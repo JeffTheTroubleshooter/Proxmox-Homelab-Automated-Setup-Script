@@ -25,7 +25,7 @@ TEMPLATE=""
 
 CONTAINERS=(
   "200|docker-stack|2|2048|16|docker"
-  "201|source-stack|2|2048|12|source"
+  "201|source-stack|2|4096|12|source"
   "202|light-stack|1|1024|8|light"
   "203|forgepanel|1|512|4|forge"
 )
@@ -33,10 +33,13 @@ CONTAINERS=(
 # role -> "script_name|Service Name|port" entries
 declare -A ROLE_SCRIPTS=(
   [docker]="immich-install.sh|Immich|2283 nextcloud-install.sh|Nextcloud|8080 romm-install.sh|RomM|8081 npm-install.sh|NginxProxyManager|81"
-  [source]="jellyfin-install.sh|Jellyfin|8096 navidrome-install.sh|Navidrome|4533 filebrowser-install.sh|FileBrowser|8082 adguard-install.sh|AdGuard Home|3000"
+  [source]="jellyfin-install.sh|Jellyfin|8096 navidrome-install.sh|Navidrome|4533 filebrowser-install.sh|FileBrowser|8082 adguard-install.sh|AdGuardHome|3000"
   [light]="vaultwarden-install.sh|Vaultwarden|8000 trilium-install.sh|Trilium|8083"
   [forge]="forgepanel-install.sh|ForgePanel|8084"
 )
+
+# Raw URL of this script on GitHub. Override with UPDATE_URL=... if the repo path differs.
+UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/JeffTheTroubleshooter/Proxmox-Homelab-Automated-Setup-Script/main/proxmox.sh}"
 
 die()  { echo -e "\n\033[1;31mError:\033[0m $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*" >&2; }
@@ -193,7 +196,7 @@ copy_and_run_scripts() {
       "$src" "root@$ip:$dest/$script" || { warn "Failed to copy $script"; continue; }
     info "Running $script on $ip (accepting defaults)..."
     ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "root@$ip" "chmod +x $dest/$script && cd $dest && yes \"\" | ./$script" || \
+      "root@$ip" "chmod +x $dest/$script && cd $dest && export NODE_OPTIONS=--max-old-space-size=3072 && yes \"\" | ./$script" || \
       warn "$script exited with an error on $ip"
   done
   rm -rf "$tmpdir"
@@ -250,20 +253,103 @@ print_summary() {
   ok "Done in $(elapsed)"
 }
 
+self_update() {
+  local force="${1:-}"
+  info "Checking GitHub for a newer script..."
+  local tmp
+  tmp=$(mktemp)
+  if ! curl -fsSL -o "$tmp" "$UPDATE_URL" 2>/dev/null; then
+    warn "Could not reach GitHub. Continuing with the current script."
+    rm -f "$tmp"
+    return 0
+  fi
+  if cmp -s "$tmp" "$0"; then
+    ok "Script is up to date."
+    rm -f "$tmp"
+    return 0
+  fi
+  echo
+  warn "A newer version of this script is available on GitHub."
+  echo "  $UPDATE_URL"
+  echo
+  if [[ "$force" == "--yes" ]]; then
+    local ans="y"
+  else
+    read -rp "Update the script now? [y/N]: " ans
+    ans="${ans:-n}"
+  fi
+  if [[ "$ans" =~ ^[Yy] ]]; then
+    cp "$0" "${0}.bak"
+    cp "$tmp" "$0"
+    chmod +x "$0"
+    rm -f "$tmp"
+    ok "Updated. Backup saved as ${0}.bak"
+    ok "Re-run the script to use the new version."
+    exit 0
+  fi
+  rm -f "$tmp"
+  info "Skipped update. Continuing with the current script."
+}
+
+service_update() {
+  echo "Updating services in existing containers"
+  echo "========================================"
+  check_host
+  for entry in "${CONTAINERS[@]}"; do
+    IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
+    if ! pct status "$ctid" >/dev/null 2>&1; then
+      warn "CT $ctid ($hostname) not found — skipping."
+      continue
+    fi
+    pct start "$ctid" >/dev/null 2>&1 || true
+    sleep 3
+    info "Updating services in CT $ctid ($hostname)..."
+    copy_and_run_scripts "$ctid" "$role"
+  done
+  print_summary
+}
+
+remove_packages_in_ct() {
+  local ctid="$1" role="$2"
+  local pkgs=""
+  case "$role" in
+    docker) pkgs="sudo docker-ce docker-ce-cli containerd.io docker-compose-plugin openssh-server" ;;
+    source) pkgs="sudo git gcc g++ make nodejs npm golang openssh-server" ;;
+    light)  pkgs="sudo git xz-utils openssh-server" ;;
+    forge)  pkgs="sudo python3 git openssh-server" ;;
+  esac
+  info "Removing packages in CT $ctid ($role)..."
+  pct exec "$ctid" -- bash -c "apt-get remove -y $pkgs" >/dev/null 2>&1 || true
+  ok "Packages removed in CT $ctid"
+}
+
 destroy_all() {
   echo "Destroying homelab containers"
   echo "============================="
   check_host
   for entry in "${CONTAINERS[@]}"; do
-    IFS='|' read -r ctid hostname _ _ _ _ <<< "$entry"
+    IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
     if pct status "$ctid" >/dev/null 2>&1; then
+      # make sure it is running so we can remove packages
+      pct start "$ctid" >/dev/null 2>&1 || true
+      sleep 2
+      remove_packages_in_ct "$ctid" "$role"
       info "Removing CT $ctid ($hostname)..."
       pct stop "$ctid" 2>/dev/null || true
       pct destroy "$ctid" || true
       ok "CT $ctid removed."
+    else
+      warn "CT $ctid not found."
     fi
   done
-  ok "Done."
+
+  # host-side leftovers
+  if [[ -f /root/.ssh/homelab_key ]]; then
+    rm -f /root/.ssh/homelab_key /root/.ssh/homelab_key.pub
+    ok "Removed host SSH key."
+  fi
+
+  ok "Done. Containers and installed packages removed."
 }
 
 main() {
@@ -272,7 +358,14 @@ main() {
     destroy|remove)
       destroy_all
       ;;
+    update)
+      service_update
+      ;;
+    self-update)
+      self_update --yes
+      ;;
     create|"")
+      self_update
       echo "Proxmox homelab — full install"
       echo "=============================="
       check_host
@@ -286,7 +379,7 @@ main() {
       print_summary
       ;;
     *)
-      die "Unknown option: $mode. Use: $0 [create|destroy]"
+      die "Unknown option: $mode. Use: $0 [create|update|self-update|destroy]"
       ;;
   esac
 }
@@ -2140,7 +2233,7 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git curl ca-certificates tar gcc g++ make nodejs npm golang
+        git curl ca-certificates tar gcc g++ make nodejs golang
       ;;
     dnf)
       sudo dnf install -y \
@@ -2595,7 +2688,7 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git make curl ca-certificates tar gcc g++ pkg-config nodejs npm golang
+        git make curl ca-certificates tar gcc g++ pkg-config nodejs golang
       ;;
     dnf)
       sudo dnf install -y \
