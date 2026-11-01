@@ -22,6 +22,8 @@ PASSWORD="admin"
 TRUENAS_ISO_URL="https://download.sys.truenas.net/TrueNAS-SCALE-Goldeye/25.10.7/TrueNAS-SCALE-25.10.7.iso"
 TRUENAS_ISO="TrueNAS-SCALE-25.10.7.iso"
 TRUENAS_VMID=100
+UBUNTU_ISO_URL="https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-live-server-amd64.iso"
+UBUNTU_ISO="ubuntu-26.04.1-live-server-amd64.iso"
 
 # Return the first free ID at or above $1.
 next_free_id() {
@@ -114,52 +116,60 @@ create_ct() {
 
 create_docker_vm() {
   local vmid="$1" hostname="$2" cores="$3" memory="$4" disk="$5"
-  local img_dir="/var/lib/vz/template/qcow2"
-  local img="$img_dir/debian-12-generic-amd64.qcow2"
-  local img_url="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+  local iso_dir="/var/lib/vz/template/iso"
+
+  mkdir -p "$iso_dir"
+  if [[ ! -f "$iso_dir/$UBUNTU_ISO" ]]; then
+    info "Downloading Ubuntu Server ISO..."
+    curl -fL --progress-bar -o "$iso_dir/$UBUNTU_ISO" "$UBUNTU_ISO_URL" || die "Ubuntu ISO download failed"
+  fi
+  ok "ISO ready: $iso_dir/$UBUNTU_ISO"
 
   if qm status "$vmid" >/dev/null 2>&1; then
-    warn "Docker VM $vmid already exists"
+    warn "Docker VM $vmid already exists — skipping create"
     return 0
   fi
 
-  mkdir -p "$img_dir" /root/.ssh
-  if [[ ! -f /root/.ssh/homelab_key ]]; then
-    ssh-keygen -t ed25519 -f /root/.ssh/homelab_key -N "" -q
-  fi
-  if [[ ! -f "$img" ]]; then
-    info "Downloading Debian 12 cloud image..."
-    curl -fL --progress-bar -o "$img" "$img_url" || die "Debian cloud image download failed"
-  fi
-
-  info "Creating Docker VM $vmid ($hostname) — real VM, not LXC"
+  info "Creating Docker VM $vmid ($hostname) with Ubuntu Server ISO"
   qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" \
     --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26 \
-    --agent enabled=1 --serial0 socket --vga serial0
-  qm importdisk "$vmid" "$img" "$STORAGE"
-  qm set "$vmid" --scsi0 "${STORAGE}:vm-${vmid}-disk-0" --boot order=scsi0
-  qm set "$vmid" --ide2 "${STORAGE}:cloudinit"
-  qm set "$vmid" --ciuser root --cipassword "$PASSWORD" --sshkeys /root/.ssh/homelab_key.pub
-  qm set "$vmid" --ipconfig0 ip=dhcp
-  qm resize "$vmid" scsi0 "${disk}G"
-  qm start "$vmid"
-  ok "Docker VM $vmid started"
+    --cpu host
+  qm set "$vmid" --scsi0 "${STORAGE}:${disk}"
+  qm set "$vmid" --ide2 "local:iso/${UBUNTU_ISO},media=cdrom"
+  qm set "$vmid" --boot order=ide2
+  ok "Docker VM $vmid created. Install Ubuntu Server from the console."
 }
 
-wait_for_vm() {
-  local vmid="$1" ip="" i
-  info "Waiting for Docker VM $vmid to get an IP..."
-  for i in $(seq 1 60); do
-    ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
-      | grep -oE '"ip-address" : "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' \
-      | grep -v '127.0.0.1' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
-    if [[ -n "$ip" ]]; then
-      printf '%s' "$ip"
-      return 0
-    fi
-    sleep 5
-  done
-  return 1
+print_vm_guide() {
+  echo
+  echo "========================================"
+  echo "  Docker VM install guide"
+  echo "========================================"
+  echo
+  echo "The Docker VM is created with the Ubuntu Server ISO attached."
+  echo "Terminal only. No desktop."
+  echo
+  echo "1. Start it:  qm start 200"
+  echo "2. Open the console in the Proxmox UI (VM 200 -> Console)"
+  echo "3. Install Ubuntu Server:"
+  echo "     - Network: DHCP"
+  echo "     - Storage: use the entire disk"
+  echo "     - Name: docker    Password: admin"
+  echo "     - Skip Ubuntu Pro"
+  echo "     - Install OpenSSH server: YES"
+  echo "     - Featured snaps: skip all"
+  echo "4. After reboot, remove the ISO so it boots the disk:"
+  echo "     qm set 200 --ide2 none,media=cdrom"
+  echo "     qm set 200 --boot order=scsi0"
+  echo "     qm reboot 200"
+  echo "5. SSH in and install Docker:"
+  echo "     ssh docker@<vm-ip>"
+  echo "     curl -fsSL https://get.docker.com | sudo sh"
+  echo "     sudo usermod -aG docker docker"
+  echo "6. Copy and run: immich, nextcloud, romm, npm install scripts"
+  echo
+  echo "Change the password after install: passwd"
+  echo
 }
 
 setup_ct() {
@@ -543,7 +553,7 @@ print_summary() {
   # collect IPs first
   declare -A CT_IP
   for entry in "${CONTAINERS[@]}"; do
-    IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
+    IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
     ip=$(container_ip "$ctid")
     CT_IP[$ctid]="$ip"
     [[ "$role" == "forge" ]] && forge_ip="$ip"
@@ -557,7 +567,7 @@ print_summary() {
   echo "Services by container:"
   echo
   for entry in "${CONTAINERS[@]}"; do
-    IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
+    IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
     ip="${CT_IP[$ctid]:-}"
     echo "  $hostname (CT $ctid)  ${ip:-no-ip}"
     for item in ${ROLE_SCRIPTS[$role]}; do
@@ -627,7 +637,7 @@ service_update() {
   echo "========================================"
   check_host
   for entry in "${CONTAINERS[@]}"; do
-    IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
+    IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
     if ! pct status "$ctid" >/dev/null 2>&1; then
       warn "CT $ctid ($hostname) not found — skipping."
       continue
@@ -659,7 +669,7 @@ destroy_all() {
   echo "============================="
   check_host
   for entry in "${CONTAINERS[@]}"; do
-    IFS='|' read -r ctid hostname _ _ _ role <<< "$entry"
+    IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
     if [[ "$role" == "docker" ]] && qm status "$ctid" >/dev/null 2>&1; then
       info "Removing Docker VM $ctid..."
       qm stop "$ctid" 2>/dev/null || true
@@ -748,6 +758,7 @@ main() {
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
         if [[ "$role" == "docker" ]]; then
           create_docker_vm "$ctid" "$hostname" "$cores" "$memory" "$disk"
+          continue
           local vmip
           vmip=$(wait_for_vm "$ctid") || die "Docker VM $ctid did not get an IP"
           info "Docker VM is at $vmip"
@@ -785,6 +796,7 @@ main() {
         fi
       done
       sleep 5
+      print_vm_guide
       print_summary
       ;;
     *)
