@@ -107,7 +107,47 @@ on_err() {
   fail "Command failed (exit $rc) at line $line: $cmd"
 }
 trap on_err ERR
-elapsed() { local e=$(date +%s); printf '%dm %ds' $(((e-START_TIME)/60)) $(((e-START_TIME)%60)); }
+elapsed() { local e; e=$(date +%s); printf '%dm %ds' $(((e-START_TIME)/60)) $(((e-START_TIME)%60)); }
+
+# Heartbeat: long builds/installs print "still running" every HEARTBEAT_SECS
+# with the last lines of their log, so a quiet step never looks frozen.
+HEARTBEAT_SECS="${HEARTBEAT_SECS:-30}"
+# heartbeat <pid> <label> [cmd...]: until <pid> exits, print elapsed time
+# every HEARTBEAT_SECS plus the last 3 lines printed by cmd (e.g. tail of a log).
+heartbeat() {
+  local pid="$1" label="$2" t0 now i
+  shift 2
+  t0=$(date +%s)
+  while kill -0 "$pid" 2>/dev/null; do
+    i=0
+    while (( i < HEARTBEAT_SECS )) && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+    kill -0 "$pid" 2>/dev/null || break
+    now=$(date +%s)
+    echo -e "\033[1;36m  ... ${label}: still running ($(( (now - t0) / 60 ))m $(( (now - t0) % 60 ))s, total $(elapsed))\033[0m" >&2
+    if (( $# > 0 )); then
+      { "$@" 2>/dev/null || true; } | tail -n 3 | cut -c1-160 | sed 's/^/      | /' >&2 || true
+    fi
+  done
+}
+# run_logged <label> <logfile> <cmd...>: run cmd with its output in logfile and a
+# heartbeat while it runs. On failure prints the last 40 log lines; returns cmd's exit code.
+run_logged() {
+  local label="$1" log="$2" rc=0 pid
+  shift 2
+  mkdir -p "$(dirname "$log")"
+  : > "$log"
+  info "$label (log: $log)"
+  # background job: drop the ERR trap there so only the parent prints FAILED
+  ( trap - ERR; "$@" ) >>"$log" 2>&1 &
+  pid=$!
+  heartbeat "$pid" "$label" tail -n 3 "$log"
+  wait "$pid" || rc=$?
+  if (( rc != 0 )); then
+    echo "----- last 40 lines of $log -----" >&2
+    tail -n 40 "$log" >&2 || true
+  fi
+  return "$rc"
+}
 
 # Find a readable copy of this script (needed for the embedded installers).
 # Works for: bash proxmox.sh, bash <(curl ...), and curl ... | bash.
@@ -222,9 +262,17 @@ check_host() {
 
 ensure_template() {
   pveam update >/dev/null || true
-  local name
-  name=$(pveam available 2>/dev/null | awk '/debian-12-standard/ && /amd64/ {print $2}' | sort -V | tail -1)
-  [[ -n "$name" ]] || die "No Debian 12 template found. Run 'pveam available'."
+  local name="" host_major want
+  # Binaries are built on the host, so the CTs need the same (or newer) glibc
+  # (a Debian 13 host build needs GLIBC_2.39; Debian 12 only has 2.36).
+  # Use the host's Debian release: 13 on Proxmox 9, 12 on Proxmox 8.
+  # shellcheck disable=SC1091
+  host_major=$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID%%.*}")
+  for want in "${host_major:-12}" 12; do
+    name=$(pveam available 2>/dev/null | awk -v t="^debian-${want}-standard" '$2 ~ t && /amd64/ {print $2}' | sort -V | tail -1)
+    [[ -n "$name" ]] && break
+  done
+  [[ -n "$name" ]] || die "No Debian ${host_major:-12} or 12 template found. Run 'pveam available'."
   TEMPLATE="local:vztmpl/$name"
   if ! pveam list local 2>/dev/null | grep -q "$name"; then
     info "Downloading $name ..."
@@ -307,7 +355,7 @@ setup_ct() {
       info "Installing build tools in CT $ctid..."
       pct exec "$ctid" -- bash -c '
         apt-get update -qq
-        apt-get install -y sudo git curl ca-certificates tar gcc g++ make nodejs npm golang openssh-server
+        DEBIAN_FRONTEND=noninteractive apt-get install -y sudo git curl ca-certificates tar gcc g++ make nodejs npm golang ffmpeg openssh-server
         systemctl enable --now ssh
       '
       ok "Build tools ready in CT $ctid"
@@ -414,65 +462,105 @@ host_deps() {
   ok "Host build tools ready."
 }
 
+# A host build is reused only if it carries this stamp. Bump it when the build
+# recipe changes so stale builds (e.g. FileBrowser without its web UI) are redone.
+BUILD_STAMP="2"
+build_ok() { [[ -x "$1" && "$(cat "$(dirname "$1")/.build-stamp" 2>/dev/null)" == "$BUILD_STAMP" ]]; }
+stamp_build() { echo "$BUILD_STAMP" > "$1/.build-stamp"; }
+
 build_on_host() {
   host_deps
   mkdir -p "$BUILD_ROOT"
+  local logs="$BUILD_ROOT/logs"
+  mkdir -p "$logs"
 
   # Navidrome
-  if [[ ! -x "$BUILD_ROOT/navidrome/navidrome" ]]; then
+  if ! build_ok "$BUILD_ROOT/navidrome/navidrome"; then
     step "Navidrome: host build"
-    info "Building Navidrome on the host..."
-    rm -rf "$BUILD_ROOT/navidrome-src"
-    git clone --depth 1 https://github.com/navidrome/navidrome.git "$BUILD_ROOT/navidrome-src"
-    (cd "$BUILD_ROOT/navidrome-src" && make setup && make build) || fail "Navidrome host build (make setup && make build) failed — see the output above."
+    rm -rf "$BUILD_ROOT/navidrome-src" "$BUILD_ROOT/navidrome"
+    git clone -q --depth 1 https://github.com/navidrome/navidrome.git "$BUILD_ROOT/navidrome-src"
+    run_logged "Building Navidrome on the host" "$logs/navidrome.log" \
+      bash -c "cd '$BUILD_ROOT/navidrome-src' && make setup && make build" \
+      || fail "Navidrome host build (make setup && make build) failed." "$logs/navidrome.log"
     mkdir -p "$BUILD_ROOT/navidrome"
     cp "$BUILD_ROOT/navidrome-src/navidrome" "$BUILD_ROOT/navidrome/"
+    stamp_build "$BUILD_ROOT/navidrome"
   fi
 
-  # FileBrowser
-  if [[ ! -x "$BUILD_ROOT/filebrowser/filebrowser" ]]; then
+  # FileBrowser: same steps as its installer (frontend with pnpm, then go build),
+  # otherwise the binary has no web UI and every page is a 404.
+  if ! build_ok "$BUILD_ROOT/filebrowser/filebrowser"; then
     step "FileBrowser: host build"
-    info "Building FileBrowser on the host..."
-    rm -rf "$BUILD_ROOT/filebrowser-src"
-    git clone --depth 1 https://github.com/filebrowser/filebrowser.git "$BUILD_ROOT/filebrowser-src"
-    (cd "$BUILD_ROOT/filebrowser-src" && go build -o filebrowser .) || fail "FileBrowser host build (go build) failed — see the output above."
+    if ! command -v pnpm >/dev/null 2>&1; then
+      info "Installing pnpm on the host (FileBrowser frontend)..."
+      npm install -g pnpm >/dev/null || fail "npm install -g pnpm failed."
+    fi
+    rm -rf "$BUILD_ROOT/filebrowser-src" "$BUILD_ROOT/filebrowser"
+    git clone -q --depth 1 https://github.com/filebrowser/filebrowser.git "$BUILD_ROOT/filebrowser-src"
+    run_logged "Building FileBrowser on the host (pnpm frontend + go build)" "$logs/filebrowser.log" \
+      bash -c "cd '$BUILD_ROOT/filebrowser-src/frontend' && CI=true pnpm install && pnpm run build && cd .. && go build -o filebrowser ." \
+      || fail "FileBrowser host build (pnpm frontend + go build) failed." "$logs/filebrowser.log"
+    [[ -f "$BUILD_ROOT/filebrowser-src/frontend/dist/index.html" ]] \
+      || fail "FileBrowser frontend build produced no frontend/dist/index.html." "$logs/filebrowser.log"
     mkdir -p "$BUILD_ROOT/filebrowser"
     cp "$BUILD_ROOT/filebrowser-src/filebrowser" "$BUILD_ROOT/filebrowser/"
+    stamp_build "$BUILD_ROOT/filebrowser"
   fi
 
-  # AdGuard
-  if [[ ! -x "$BUILD_ROOT/adguard/AdGuardHome" ]]; then
+  # AdGuard (full clone: its Makefile needs git history for the version)
+  if ! build_ok "$BUILD_ROOT/adguard/AdGuardHome"; then
     step "AdGuard Home: host build"
-    info "Building AdGuard Home on the host..."
-    rm -rf "$BUILD_ROOT/adguard-src"
-    git clone https://github.com/AdguardTeam/AdGuardHome.git "$BUILD_ROOT/adguard-src"
-    (cd "$BUILD_ROOT/adguard-src" && make) || fail "AdGuard Home host build (make) failed — see the output above."
+    rm -rf "$BUILD_ROOT/adguard-src" "$BUILD_ROOT/adguard"
+    git clone -q https://github.com/AdguardTeam/AdGuardHome.git "$BUILD_ROOT/adguard-src"
+    run_logged "Building AdGuard Home on the host" "$logs/adguard.log" \
+      bash -c "cd '$BUILD_ROOT/adguard-src' && make" \
+      || fail "AdGuard Home host build (make) failed." "$logs/adguard.log"
     mkdir -p "$BUILD_ROOT/adguard"
     cp "$BUILD_ROOT/adguard-src/AdGuardHome" "$BUILD_ROOT/adguard/"
+    stamp_build "$BUILD_ROOT/adguard"
   fi
 
-  # Vaultwarden
-  if [[ ! -x "$BUILD_ROOT/vaultwarden/vaultwarden" ]]; then
+  # Vaultwarden (web vault is added at deploy time, from the installer's URL)
+  if ! build_ok "$BUILD_ROOT/vaultwarden/vaultwarden"; then
     step "Vaultwarden: host build"
-    info "Building Vaultwarden on the host..."
     # shellcheck disable=SC1091
     [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
-    rm -rf "$BUILD_ROOT/vaultwarden-src"
-    git clone --depth 1 https://github.com/dani-garcia/vaultwarden.git "$BUILD_ROOT/vaultwarden-src"
-    (cd "$BUILD_ROOT/vaultwarden-src" && cargo build --features sqlite --release) || fail "Vaultwarden host build (cargo build) failed — see the output above."
+    rm -rf "$BUILD_ROOT/vaultwarden-src" "$BUILD_ROOT/vaultwarden"
+    git clone -q --depth 1 https://github.com/dani-garcia/vaultwarden.git "$BUILD_ROOT/vaultwarden-src"
+    run_logged "Building Vaultwarden on the host (cargo, $(nproc) cores)" "$logs/vaultwarden.log" \
+      bash -c "cd '$BUILD_ROOT/vaultwarden-src' && cargo build --features sqlite --release" \
+      || fail "Vaultwarden host build (cargo build) failed." "$logs/vaultwarden.log"
     mkdir -p "$BUILD_ROOT/vaultwarden"
     cp "$BUILD_ROOT/vaultwarden-src/target/release/vaultwarden" "$BUILD_ROOT/vaultwarden/"
+    stamp_build "$BUILD_ROOT/vaultwarden"
   fi
 
   ok "Host builds finished."
 }
 
+# Newest GLIBC_x.y a binary needs (empty if none / not dynamic).
+glibc_needed() {
+  { objdump -T "$1" 2>/dev/null || strings "$1" 2>/dev/null; } | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1
+}
+# Fail clearly if a host-built binary needs a newer glibc than CT <ctid> has.
+check_glibc() {
+  local ctid="$1" bin="$2" app="$3" need have
+  need=$(glibc_needed "$bin")
+  [[ -n "$need" ]] || return 0
+  have=$(pct exec "$ctid" -- ldd --version 2>/dev/null | head -1 | grep -o '[0-9][0-9.]*$' || true)
+  [[ -n "$have" ]] || return 0
+  if [[ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -1)" != "$have" ]]; then
+    fail "$app was built on the host against glibc $need, but CT $ctid has glibc $have. Recreate the CT from the same Debian release as the host (bash $0 destroy, then rerun)."
+  fi
+}
+
 # Deploy a host-built binary into a container and start it. Returns 0 if handled.
 deploy_built() {
-  local ctid="$1" script="$2"
+  local ctid="$1" script="$2" installer="${3:-}"
   case "$script" in
     navidrome-install.sh)
       [[ -x "$BUILD_ROOT/navidrome/navidrome" ]] || return 1
+      check_glibc "$ctid" "$BUILD_ROOT/navidrome/navidrome" "Navidrome"
       info "Deploying Navidrome into CT $ctid"
       pct exec "$ctid" -- mkdir -p /opt/navidrome /mnt/music
       pct push "$ctid" "$BUILD_ROOT/navidrome/navidrome" /opt/navidrome/navidrome
@@ -503,6 +591,7 @@ U
       ;;
     filebrowser-install.sh)
       [[ -x "$BUILD_ROOT/filebrowser/filebrowser" ]] || return 1
+      check_glibc "$ctid" "$BUILD_ROOT/filebrowser/filebrowser" "FileBrowser"
       info "Deploying FileBrowser into CT $ctid"
       pct exec "$ctid" -- mkdir -p /opt/filebrowser /srv/files
       pct push "$ctid" "$BUILD_ROOT/filebrowser/filebrowser" /usr/local/bin/filebrowser
@@ -530,6 +619,7 @@ U
       ;;
     adguard-install.sh)
       [[ -x "$BUILD_ROOT/adguard/AdGuardHome" ]] || return 1
+      check_glibc "$ctid" "$BUILD_ROOT/adguard/AdGuardHome" "AdGuard Home"
       info "Deploying AdGuard Home into CT $ctid"
       pct exec "$ctid" -- mkdir -p /opt/adguardhome
       pct push "$ctid" "$BUILD_ROOT/adguard/AdGuardHome" /usr/local/bin/AdGuardHome
@@ -555,13 +645,32 @@ U
       ;;
     vaultwarden-install.sh)
       [[ -x "$BUILD_ROOT/vaultwarden/vaultwarden" ]] || return 1
+      check_glibc "$ctid" "$BUILD_ROOT/vaultwarden/vaultwarden" "Vaultwarden"
       info "Deploying Vaultwarden into CT $ctid"
-      pct exec "$ctid" -- mkdir -p /opt/vaultwarden/data
+      # The binary refuses to start without the web vault. Take the bw_web_builds
+      # release URL from Vaultwarden's installer (source of truth), like it does.
+      local web_url web_tgz
+      web_url=$(grep -o 'https://github.com/dani-garcia/bw_web_builds/releases/download/[^}"[:space:]]*\.tar\.gz' "$installer" 2>/dev/null | head -1 || true)
+      [[ -n "$web_url" ]] || fail "Could not find the web vault URL in vaultwarden-install.sh."
+      web_tgz="$BUILD_ROOT/vaultwarden/$(basename "$web_url")"
+      if [[ ! -s "$web_tgz" ]]; then
+        info "Downloading web vault: $web_url"
+        if ! curl -fsSL --retry 3 -o "$web_tgz.part" "$web_url"; then
+          rm -f "$web_tgz.part"
+          fail "Web vault download failed: $web_url"
+        fi
+        mv "$web_tgz.part" "$web_tgz"
+      fi
+      pct exec "$ctid" -- mkdir -p /opt/vaultwarden/data /opt/vaultwarden/web-vault
       pct push "$ctid" "$BUILD_ROOT/vaultwarden/vaultwarden" /opt/vaultwarden/vaultwarden
+      pct push "$ctid" "$web_tgz" /tmp/bw_web.tar.gz
+      pct exec "$ctid" -- bash -c 'rm -rf /opt/vaultwarden/web-vault/* && tar -xzf /tmp/bw_web.tar.gz -C /opt/vaultwarden/web-vault --strip-components=1 && rm -f /tmp/bw_web.tar.gz && test -f /opt/vaultwarden/web-vault/index.html' \
+        || fail "Web vault extract into CT $ctid failed."
       pct exec "$ctid" -- bash -c '
         chmod +x /opt/vaultwarden/vaultwarden
         cat >/opt/vaultwarden/vaultwarden.env <<E
 DATA_FOLDER=/opt/vaultwarden/data
+WEB_VAULT_FOLDER=/opt/vaultwarden/web-vault
 ROCKET_ADDRESS=0.0.0.0
 ROCKET_PORT=8000
 SIGNUPS_ALLOWED=true
@@ -572,6 +681,7 @@ Description=Vaultwarden
 After=network.target
 [Service]
 Type=simple
+WorkingDirectory=/opt/vaultwarden
 EnvironmentFile=/opt/vaultwarden/vaultwarden.env
 ExecStart=/opt/vaultwarden/vaultwarden
 Restart=on-failure
@@ -608,6 +718,7 @@ lock_down() {
 copy_and_run_scripts() {
   local ctid="$1" role="$2"
   local dest="/root/scripts"
+  boost_ct "$ctid" "$role"
   prepare_ssh "$ctid"
   local ip
   ip=$(container_ip "$ctid")
@@ -628,7 +739,7 @@ copy_and_run_scripts() {
     scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$src" "root@$ip:$dest/$script" || fail "scp of $script to $ip failed."
     step "$svc ($script) in CT $ctid: deploy"
-    if deploy_built "$ctid" "$script"; then
+    if deploy_built "$ctid" "$script" "$src"; then
       continue
     fi
     if [[ "$script" == "immich-install.sh" && "$SKIP_IMMICH_ML" == "1" ]]; then
@@ -641,20 +752,92 @@ copy_and_run_scripts() {
     info "Running $script on $ip ..."
     # Feed a fixed set of newlines so prompts take defaults.
     # Stream output live so it does not look stuck.
-    printf '\n%.0s' {1..30} | ssh -i /root/.ssh/homelab_key \
-      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "root@$ip" "export COMPOSE_PARALLEL_LIMIT=1; chmod +x $dest/$script && cd $dest && ./$script" || {
+    # Output streams live; a heartbeat (elapsed time + log tail) is printed every
+    # HEARTBEAT_SECS so quiet phases (e.g. Jellyfin's web build) never look frozen.
+    local rc=0 pid ilog="${INSTALLER_LOGS[$script]:-}"
+    (
+      trap - ERR   # only the parent reports FAILED
+      printf '\n%.0s' {1..30} | ssh -i /root/.ssh/homelab_key \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@$ip" "export COMPOSE_PARALLEL_LIMIT=1; chmod +x $dest/$script && cd $dest && ./$script"
+    ) &
+    pid=$!
+    if [[ -n "$ilog" ]]; then
+      heartbeat "$pid" "$svc install in CT $ctid" pct exec "$ctid" -- tail -n 3 "$ilog"
+    else
+      heartbeat "$pid" "$svc install in CT $ctid"
+    fi
+    wait "$pid" || rc=$?
+    if (( rc != 0 )); then
       step "$svc ($script) in CT $ctid ($ip): install"
-      fail "$script exited with an error on $ip (output above)." \
-        "${INSTALLER_LOGS[$script]:+CT $ctid:${INSTALLER_LOGS[$script]} (read with: pct exec $ctid -- tail -n 100 ${INSTALLER_LOGS[$script]})}"
-    }
+      fail "$script exited with an error (exit $rc) on $ip (output above)." \
+        "${ilog:+CT $ctid:$ilog (read with: pct exec $ctid -- tail -n 100 $ilog)}"
+    fi
     if [[ "$script" == "immich-install.sh" && "$SKIP_IMMICH_ML" == "1" ]]; then
       ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         "root@$ip" "cd /opt/immich 2>/dev/null && docker compose rm -sf immich-machine-learning >/dev/null 2>&1; true" || true
     fi
   done
   rm -rf "$tmpdir"
+  unboost_ct "$ctid"
   ok "Services installed on CT $ctid ($ip)"
+}
+
+# Jellyfin builds from source inside CT 201 (dotnet + webpack). Give the CT all
+# host cores while the installers run, then put the configured limits back.
+declare -A CT_LIMITS=()
+boost_ct() {
+  local ctid="$1" role="$2" n cfg
+  [[ "$role" == "source" ]] || return 0
+  n=$(nproc 2>/dev/null || echo 4)
+  cfg=$(pct config "$ctid" 2>/dev/null) || return 0
+  CT_LIMITS[$ctid]="$(awk '/^cores:/ {print $2}' <<< "$cfg")|$(awk '/^cpulimit:/ {print $2}' <<< "$cfg")"
+  if pct set "$ctid" --cores "$n" --cpulimit 0 >/dev/null 2>&1; then
+    info "CT $ctid: using all $n host cores during the build (restored afterwards)."
+  fi
+}
+unboost_ct() {
+  local ctid="$1" cores cpulimit
+  [[ -n "${CT_LIMITS[$ctid]:-}" ]] || return 0
+  IFS='|' read -r cores cpulimit <<< "${CT_LIMITS[$ctid]}"
+  pct set "$ctid" --cores "${cores:-4}" --cpulimit "${cpulimit:-0}" >/dev/null 2>&1 \
+    || warn "Could not restore CPU limits on CT $ctid (cores=${cores}, cpulimit=${cpulimit})."
+  unset "CT_LIMITS[$ctid]"
+}
+
+# URL scheme a service answers on (ForgePanel is HTTPS with a self-signed cert).
+svc_scheme() { [[ "$1" == "ForgePanel" ]] && echo https || echo http; }
+
+# After the final start, every service must answer on its port. A 404 on "/"
+# counts as broken (that is what FileBrowser without its web UI returns).
+health_checks() {
+  info "Health checks: every service must answer on its port..."
+  local entry ctid hostname role ip item script svc port url code t0 deadline
+  local timeout="${HEALTH_TIMEOUT:-300}"
+  for entry in "${CONTAINERS[@]}"; do
+    IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
+    ip=$(container_ip "$ctid")
+    for item in ${ROLE_SCRIPTS[$role]}; do
+      IFS='|' read -r script svc port <<< "$item"
+      step "$svc ($script) in CT $ctid: health check"
+      [[ -n "$ip" ]] || fail "CT $ctid ($hostname) has no IP address, so $svc cannot be reached."
+      url="$(svc_scheme "$svc")://$ip:$port/"
+      t0=$(date +%s); deadline=$((t0 + timeout)); code=000
+      while :; do
+        code=$(curl -sk -o /dev/null -m 10 -w '%{http_code}' "$url" 2>/dev/null) || true
+        [[ "$code" =~ ^[23][0-9][0-9]$|^401$ ]] && break
+        (( $(date +%s) >= deadline )) && break
+        sleep 5
+        (( ( $(date +%s) - t0 ) % 30 < 5 )) && info "  waiting for $svc at $url (HTTP ${code:-000}, $(( $(date +%s) - t0 ))s)"
+      done
+      if [[ ! "$code" =~ ^[23][0-9][0-9]$|^401$ ]]; then
+        echo "----- CT $ctid: listening TCP ports -----" >&2
+        pct exec "$ctid" -- ss -ltn 2>/dev/null >&2 || true
+        fail "$svc is not answering at $url (HTTP ${code:-000} after ${timeout}s). Check: pct exec $ctid -- systemctl status --no-pager -l; pct exec $ctid -- journalctl -b --no-pager -n 80"
+      fi
+      ok "  $svc OK  $url (HTTP $code)"
+    done
+  done
 }
 
 print_summary() {
@@ -690,7 +873,7 @@ print_summary() {
     for item in ${ROLE_SCRIPTS[$role]}; do
       IFS='|' read -r script svc port <<< "$item"
       if [[ -n "$ip" ]]; then
-        printf '    %-22s http://%s:%s\n' "$svc" "$ip" "$port"
+        printf '    %-22s %s://%s:%s\n' "$svc" "$(svc_scheme "$svc")" "$ip" "$port"
       else
         printf '    %-22s (container has no IP)\n' "$svc"
       fi
@@ -771,6 +954,7 @@ service_update() {
     info "Updating services in CT $ctid ($hostname)..."
     copy_and_run_scripts "$ctid" "$role"
   done
+  health_checks
   print_summary
 }
 
@@ -792,7 +976,7 @@ remove_packages_in_ct() {
       ' >/dev/null 2>&1 || true
       pkgs="docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin openssh-server"
       ;;
-    source) pkgs="git gcc g++ make nodejs npm golang openssh-server" ;;
+    source) pkgs="git gcc g++ make nodejs npm golang ffmpeg openssh-server" ;;
     light)  pkgs="git xz-utils openssh-server" ;;
     forge)  pkgs="python3 git openssh-server" ;;
   esac
@@ -1029,6 +1213,7 @@ main() {
         fi
       done
       sleep 5
+      health_checks
       print_summary
       ;;
     *)
@@ -3049,7 +3234,7 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git curl ca-certificates tar gcc g++ make nodejs golang
+        git curl ca-certificates tar gcc g++ make nodejs npm golang
       ;;
     dnf)
       sudo dnf install -y \

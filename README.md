@@ -2,16 +2,16 @@
 
 > ⚠️ **Experimental.** This script is still being fixed and tested. Expect bugs, and try it on a test Proxmox host first.
 
-One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, installs a full homelab inside them and prints every URL at the end. Use [ForgePanel](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) to see them all in one place.
+One script, run on a Proxmox VE host, that creates 4 Debian LXC containers (Debian 13 on Proxmox 9, Debian 12 on Proxmox 8), installs a full homelab inside them and prints every URL at the end. Use [ForgePanel](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) to see them all in one place.
 
 | CT | Name | CPU | RAM | Disk | Services |
 |----|------|-----|-----|------|----------|
 | 200 | docker-stack | 2 | 1536 MB | 20 GB | Immich (2283), Nextcloud (8080), RomM (8081), Nginx Proxy Manager (81) |
 | 201 | source-stack | 4 | 3072 MB | 16 GB | Jellyfin (8096), Navidrome (4533), FileBrowser (8082), AdGuard Home (3000) |
 | 202 | light-stack | 1 | 768 MB | 8 GB | Vaultwarden (8000), Trilium (8083) |
-| 203 | forgepanel | 1 | 384 MB | 4 GB | ForgePanel (https://<ip>:8084) |
+| 203 | forgepanel | 1 | 384 MB | 4 GB | ForgePanel (**https**://<ip>:8084, self-signed cert) |
 
-> **ForgePanel** is served over **HTTPS** by default at `https://<forgepanel-ip>:8084` with a self-signed certificate (your browser warns once). For no warning, put it behind Nginx Proxy Manager with a real certificate.
+> **ForgePanel** is served over **HTTPS** by default at `https://<forgepanel-ip>:8084` with a self-signed certificate (your browser warns once). Use `https://`, not `http://`: plain HTTP on port 8084 gets an empty reply. The final summary prints it as HTTPS too. For no warning, put it behind Nginx Proxy Manager with a real certificate.
 
 > **Note:** TrueNAS is set up manually. This script no longer creates a TrueNAS VM or downloads its ISO; create and install TrueNAS yourself in Proxmox if you want it.
 
@@ -50,13 +50,18 @@ On a normal run the script also checks GitHub for a newer copy of itself and off
 
 ## What happens during a run
 
-1. Downloads the newest Debian 12 LXC template.
-2. Installs build tools on the Proxmox host (Go, Node, Rust, gcc) and builds the source-based services there — Navidrome, FileBrowser, AdGuard Home and Vaultwarden — into `/root/homelab-builds`. Building on the host uses every core instead of a container's CPU limit.
+1. Downloads the newest Debian LXC template matching the host's Debian release (13 on Proxmox 9, falling back to 12). Host-built binaries need the same glibc as the containers, and the script stops with a clear error if they don't match.
+2. Installs build tools on the Proxmox host (Go, Node, Rust, gcc) and builds the source-based services there — Navidrome, FileBrowser, AdGuard Home and Vaultwarden — into `/root/homelab-builds`, using the same steps as each app's installer (FileBrowser's pnpm web UI is built before `go build`, and Vaultwarden gets the web vault release its installer pins). Building on the host uses every core instead of a container's CPU limit. Build logs are in `/root/homelab-builds/logs/`, and finished builds are reused on the next run.
 3. Creates each container with its CPU limit, memory, swap and disk settings.
-4. Installs the role's base packages (Docker, build tools, Python, etc.).
+4. Installs the role's base packages (Docker, build tools, Python, etc.). `source-stack` also gets `ffmpeg`, because Jellyfin shuts down at startup when it can't find FFmpeg.
 5. Pushes the host-built binaries into their container and installs them as systemd services; anything not built on the host gets its installer script copied in over SSH and run with its prompts on defaults.
 6. Removes SSH from the container and stops it once the installs finish.
 7. Starts all containers again.
+8. Runs health checks: every service must answer on its port (ForgePanel over HTTPS). If one doesn't, the run stops with a red `FAILED: <app> ... health check` line instead of printing `Homelab ready`.
+
+### Progress output
+
+Long steps never go quiet. Every 30 seconds the script prints the step's elapsed time and the last lines of its log, for example while Jellyfin builds from source in `source-stack` (dotnet publish plus the webpack build of jellyfin-web, often 20–30 minutes). Change the interval with `HEARTBEAT_SECS=60 bash proxmox.sh`. During the installs `source-stack` gets every host core, then its normal CPU limit is put back.
 
 ## Security note
 
