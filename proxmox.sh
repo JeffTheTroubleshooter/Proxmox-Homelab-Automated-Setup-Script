@@ -2289,24 +2289,24 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3 python3-git python3-yaml docker.io curl ca-certificates
+        git python3 python3-git python3-yaml python3-packaging docker.io curl ca-certificates
       ;;
     dnf)
       if ! command -v docker >/dev/null 2>&1; then
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml docker curl ca-certificates || \
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml moby-engine curl ca-certificates
+        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging docker curl ca-certificates || \
+        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging moby-engine curl ca-certificates
       else
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml curl ca-certificates
+        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging curl ca-certificates
       fi
       ;;
     pacman)
-      sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml docker curl ca-certificates
+      sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml python-packaging docker curl ca-certificates
       ;;
     zypper)
-      sudo zypper --non-interactive install git python3 python3-GitPython python3-PyYAML docker curl ca-certificates
+      sudo zypper --non-interactive install git python3 python3-GitPython python3-PyYAML python3-packaging docker curl ca-certificates
       ;;
     apk)
-      sudo apk add --no-cache git python3 py3-gitpython py3-yaml docker curl ca-certificates
+      sudo apk add --no-cache git python3 py3-gitpython py3-yaml py3-packaging docker curl ca-certificates
       ;;
   esac
 
@@ -2320,6 +2320,46 @@ install_packages() {
   ok "Dependencies ready."
 }
 
+# ── python modules needed by jellyfin-packaging/build.py ───────────────────
+# build.py imports: git (GitPython), yaml (PyYAML), packaging. Install via the
+# distro packages above; fall back to pip (--break-system-packages) for any
+# module still missing, then fail clearly if one can't be imported.
+PY_MODS=(git yaml packaging)
+py_mod_pip_name() {
+  case "$1" in
+    git) echo GitPython ;; yaml) echo PyYAML ;; *) echo "$1" ;;
+  esac
+}
+missing_py_mods() {
+  local m out=()
+  for m in "${PY_MODS[@]}"; do
+    python3 -c "import $m" >/dev/null 2>&1 || out+=("$m")
+  done
+  echo "${out[*]:-}"
+}
+ensure_python_modules() {
+  command -v python3 >/dev/null 2>&1 || die "python3 not found after installing dependencies."
+  local missing m pips=()
+  missing=$(missing_py_mods)
+  [[ -z "$missing" ]] && { ok "Python modules ready (${PY_MODS[*]})."; return 0; }
+  warn "Python modules missing from distro packages: $missing — trying pip..."
+  for m in $missing; do pips+=("$(py_mod_pip_name "$m")"); done
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    case "$PKG" in
+      apt)    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip || true ;;
+      dnf)    sudo dnf install -y python3-pip || true ;;
+      pacman) sudo pacman -S --noconfirm python-pip || true ;;
+      zypper) sudo zypper --non-interactive install python3-pip || true ;;
+      apk)    sudo apk add --no-cache py3-pip || true ;;
+    esac
+  fi
+  sudo python3 -m pip install --break-system-packages "${pips[@]}" 2>/dev/null || \
+    sudo python3 -m pip install "${pips[@]}" || true
+  missing=$(missing_py_mods)
+  [[ -z "$missing" ]] || die "Python module(s) still missing: $missing. build.py needs: GitPython, PyYAML, packaging. Install them and rerun."
+  ok "Python modules ready (${PY_MODS[*]})."
+}
+
 # ── build ──────────────────────────────────────────────────────────────────
 # Returns archive path via global ARCHIVE (avoids pipefail + command-sub issues)
 build_jellyfin() {
@@ -2331,6 +2371,7 @@ build_jellyfin() {
   info "Initializing submodules..."
   git submodule update --init
 
+  ensure_python_modules
   info "Building portable Linux archive (this can take several minutes)..."
   if docker info >/dev/null 2>&1; then
     ./build.py auto linux amd64 || true
@@ -2432,11 +2473,11 @@ remove_packages() {
   if ask_yn "Also remove build packages (git, python3, docker, etc.)? (may affect other software)"; then
     info "Removing packages..."
     case "$PKG" in
-      apt)    sudo apt-get remove -y git python3 python3-git python3-yaml docker.io || true ;;
-      dnf)    sudo dnf remove -y git python3 python3-GitPython python3-pyyaml docker || true ;;
-      pacman) sudo pacman -Rns --noconfirm git python python-gitpython python-pyyaml docker || true ;;
-      zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML docker || true ;;
-      apk)    sudo apk del git python3 py3-gitpython py3-yaml docker || true ;;
+      apt)    sudo apt-get remove -y git python3 python3-git python3-yaml python3-packaging docker.io || true ;;
+      dnf)    sudo dnf remove -y git python3 python3-GitPython python3-pyyaml python3-packaging docker || true ;;
+      pacman) sudo pacman -Rns --noconfirm git python python-gitpython python-pyyaml python-packaging docker || true ;;
+      zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML python3-packaging docker || true ;;
+      apk)    sudo apk del git python3 py3-gitpython py3-yaml py3-packaging docker || true ;;
     esac
     ok "Package removal finished."
   else
