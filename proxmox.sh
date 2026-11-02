@@ -35,9 +35,6 @@ SKIP_IMMICH_ML=0
 SELF=""                                   # readable path to this script (set by resolve_self)
 
 PASSWORD="admin"
-TRUENAS_ISO_URL="https://download.sys.truenas.net/TrueNAS-SCALE-Goldeye/25.10.7/TrueNAS-SCALE-25.10.7.iso"
-TRUENAS_ISO="TrueNAS-SCALE-25.10.7.iso"
-TRUENAS_VMID=100
 
 # Return the first free ID at or above $1.
 next_free_id() {
@@ -621,33 +618,6 @@ copy_and_run_scripts() {
   ok "Services installed on CT $ctid ($ip)"
 }
 
-setup_truenas() {
-  info "Downloading TrueNAS SCALE ISO..."
-  local iso_dir="/var/lib/vz/template/iso"
-  mkdir -p "$iso_dir"
-  if [[ ! -f "$iso_dir/$TRUENAS_ISO" ]]; then
-    curl -fL --progress-bar -o "$iso_dir/$TRUENAS_ISO" "$TRUENAS_ISO_URL" || die "TrueNAS ISO download failed"
-  fi
-  ok "ISO ready: $iso_dir/$TRUENAS_ISO"
-
-  if qm status "$TRUENAS_VMID" >/dev/null 2>&1 || pct status "$TRUENAS_VMID" >/dev/null 2>&1; then
-    local free
-    free=$(next_free_id "$TRUENAS_VMID")
-    warn "VM ID $TRUENAS_VMID is taken — using $free for TrueNAS"
-    TRUENAS_VMID="$free"
-  fi
-
-  info "Creating TrueNAS VM $TRUENAS_VMID..."
-  qm create "$TRUENAS_VMID" --name truenas --memory 4096 --cores 2 --cpu host \
-    --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26 --tags "$GUEST_TAG"
-  record_id vm "$TRUENAS_VMID"
-  qm set "$TRUENAS_VMID" --scsi0 "${STORAGE}:32"
-  qm set "$TRUENAS_VMID" --ide2 "local:iso/${TRUENAS_ISO},media=cdrom"
-  qm set "$TRUENAS_VMID" --boot order=ide2
-  qm set "$TRUENAS_VMID" --serial0 socket --vga serial0
-  ok "TrueNAS VM created. Start it from the Proxmox console to install."
-}
-
 print_summary() {
   echo
   echo "========================================"
@@ -689,8 +659,7 @@ print_summary() {
     echo
   done
 
-  echo "TrueNAS VM:  $TRUENAS_VMID (ISO attached, start it to install)"
-  echo "  qm start $TRUENAS_VMID"
+  echo "TrueNAS is not created by this script; set it up manually."
   echo
   echo "Default password for every container: $PASSWORD"
   echo "CHANGE THIS PASSWORD on each container once the script is done."
@@ -926,12 +895,6 @@ destroy_all() {
     ok "Removed $BUILD_ROOT"
   fi
 
-  read -r -p "Remove downloaded TrueNAS ISO from /var/lib/vz/template/iso? [y/N]: " ans
-  if [[ "${ans,,}" == "y" ]]; then
-    rm -f "/var/lib/vz/template/iso/$TRUENAS_ISO"
-    ok "ISOs removed."
-  fi
-
   ok "Done. Guests created by this script and chosen host leftovers removed."
 }
 
@@ -1016,7 +979,6 @@ main() {
           lock_down "$ctid"
         fi
       done
-      setup_truenas
       info "Starting all containers (SSH stays off)..."
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"

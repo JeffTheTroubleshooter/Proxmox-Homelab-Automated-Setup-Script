@@ -2,7 +2,7 @@
 
 > ⚠️ **Experimental.** This script is still being fixed and tested. Expect bugs, and try it on a test Proxmox host first.
 
-One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, installs a full homelab inside them, creates a TrueNAS SCALE VM, and prints every URL at the end. Use [ForgePanel](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) to see them all in one place.
+One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, installs a full homelab inside them and prints every URL at the end. Use [ForgePanel](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) to see them all in one place.
 
 | CT | Name | CPU | RAM | Disk | Services |
 |----|------|-----|-----|------|----------|
@@ -11,7 +11,7 @@ One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, i
 | 202 | light-stack | 1 | 768 MB | 8 GB | Vaultwarden (8000), Trilium (8083) |
 | 203 | forgepanel | 1 | 384 MB | 4 GB | ForgePanel (8084) |
 
-A **TrueNAS SCALE VM** (ID 100, 4 GB RAM, 2 cores) is also created with the installer ISO attached. The script does not install TrueNAS for you: start the VM and walk through the installer in the Proxmox console.
+> **Note:** TrueNAS is set up manually. This script no longer creates a TrueNAS VM or downloads its ISO; create and install TrueNAS yourself in Proxmox if you want it.
 
 The `docker-stack` container is created **privileged** (`nesting=1,keyctl=1,fuse=1`) so Docker can use `overlay2`. In an unprivileged container Docker falls back to `fuse-overlayfs`, which unpacks image layers very slowly. The other three containers are unprivileged.
 
@@ -23,10 +23,10 @@ On the Proxmox host, as root:
 bash proxmox.sh               # create + install everything
 bash proxmox.sh update        # re-run the installers in existing containers
 bash proxmox.sh self-update   # pull the newest version of this script from GitHub
-bash proxmox.sh destroy       # remove the containers and the TrueNAS VM
+bash proxmox.sh destroy       # remove the containers created by the script
 ```
 
-Defaults: bridge `vmbr0`, storage `local-lvm`, container IDs 200–203, TrueNAS VM ID 100. If a default ID is already in use, the script picks the next free one.
+Defaults: bridge `vmbr0`, storage `local-lvm`, container IDs 200–203. If a default ID is already in use, the script picks the next free one.
 
 On a normal run the script also checks GitHub for a newer copy of itself and offers to update before doing anything else.
 
@@ -38,7 +38,7 @@ On a normal run the script also checks GitHub for a newer copy of itself and off
 4. Installs the role's base packages (Docker, build tools, Python, etc.).
 5. Pushes the host-built binaries into their container and installs them as systemd services; anything not built on the host gets its installer script copied in over SSH and run with its prompts on defaults.
 6. Removes SSH from the container and stops it once the installs finish.
-7. Creates the TrueNAS VM, then starts all containers again.
+7. Starts all containers again.
 
 ## Security note
 
