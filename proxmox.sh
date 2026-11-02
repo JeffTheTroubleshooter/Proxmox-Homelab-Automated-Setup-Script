@@ -17,7 +17,7 @@
 #   203 forgepanel     ForgePanel dashboard
 #
 
-set -euo pipefail
+set -Eeuo pipefail
 
 START_TIME=$(date +%s)
 
@@ -84,6 +84,29 @@ die()  { echo -e "\n\033[1;31mError:\033[0m $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*" >&2; }
 ok()   { echo -e "\033[1;32m==>\033[0m $*" >&2; }
 warn() { echo -e "\033[1;33m==>\033[0m $*" >&2; }
+
+# ── strict mode: the first failed step stops the whole run ─────────────────
+STEP="startup"     # human-readable "<app>: <step>" for error messages
+step() { STEP="$*"; }
+# installer -> log file inside the guest (besides the output streamed above)
+declare -A INSTALLER_LOGS=(
+  [jellyfin-install.sh]="/var/log/jellyfin-build.log"
+)
+fail() {
+  local msg="$1" log="${2:-}"
+  echo -e "\n\033[1;31mFAILED:\033[0m \033[1m${STEP}\033[0m" >&2
+  echo -e "\033[1;31m  ${msg}\033[0m" >&2
+  [[ -n "$log" ]] && echo -e "\033[1;31m  Log: ${log}\033[0m" >&2
+  echo -e "  Stopped here; nothing after this step ran. Fix the cause, then rerun:\n    bash $0\n  or start clean with:\n    bash $0 destroy" >&2
+  exit 1
+}
+# shellcheck disable=SC2329  # invoked via trap
+on_err() {
+  local rc=$? line=${BASH_LINENO[0]} cmd=$BASH_COMMAND
+  trap - ERR
+  fail "Command failed (exit $rc) at line $line: $cmd"
+}
+trap on_err ERR
 elapsed() { local e=$(date +%s); printf '%dm %ds' $(((e-START_TIME)/60)) $(((e-START_TIME)%60)); }
 
 # Find a readable copy of this script (needed for the embedded installers).
@@ -247,8 +270,11 @@ create_ct() {
 
 setup_ct() {
   local ctid="$1" role="$2"
+  step "CT $ctid: start"
   info "Starting CT $ctid..."
-  pct start "$ctid" || true
+  if [[ "$(pct status "$ctid" 2>/dev/null)" != "status: running" ]]; then
+    pct start "$ctid" || fail "pct start $ctid failed."
+  fi
   sleep 5
 
   case "$role" in
@@ -346,6 +372,7 @@ extract_script() {
 BUILD_ROOT="/root/homelab-builds"
 
 host_deps() {
+  step "Host: installing build tools"
   info "Installing host build tools..."
   mkdir -p "$STATE_DIR"
   local before
@@ -354,7 +381,7 @@ host_deps() {
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git curl ca-certificates tar gcc g++ make pkg-config \
-    golang build-essential libssl-dev libsqlite3-dev || true
+    golang build-essential libssl-dev libsqlite3-dev
 
   # Navidrome requires Node 24+. Debian's nodejs is too old.
   local node_major=0
@@ -392,44 +419,48 @@ build_on_host() {
 
   # Navidrome
   if [[ ! -x "$BUILD_ROOT/navidrome/navidrome" ]]; then
+    step "Navidrome: host build"
     info "Building Navidrome on the host..."
     rm -rf "$BUILD_ROOT/navidrome-src"
     git clone --depth 1 https://github.com/navidrome/navidrome.git "$BUILD_ROOT/navidrome-src"
-    (cd "$BUILD_ROOT/navidrome-src" && make setup && make build) || warn "Navidrome host build failed"
+    (cd "$BUILD_ROOT/navidrome-src" && make setup && make build) || fail "Navidrome host build (make setup && make build) failed — see the output above."
     mkdir -p "$BUILD_ROOT/navidrome"
-    cp "$BUILD_ROOT/navidrome-src/navidrome" "$BUILD_ROOT/navidrome/" 2>/dev/null || true
+    cp "$BUILD_ROOT/navidrome-src/navidrome" "$BUILD_ROOT/navidrome/"
   fi
 
   # FileBrowser
   if [[ ! -x "$BUILD_ROOT/filebrowser/filebrowser" ]]; then
+    step "FileBrowser: host build"
     info "Building FileBrowser on the host..."
     rm -rf "$BUILD_ROOT/filebrowser-src"
     git clone --depth 1 https://github.com/filebrowser/filebrowser.git "$BUILD_ROOT/filebrowser-src"
-    (cd "$BUILD_ROOT/filebrowser-src" && go build -o filebrowser .) || warn "FileBrowser host build failed"
+    (cd "$BUILD_ROOT/filebrowser-src" && go build -o filebrowser .) || fail "FileBrowser host build (go build) failed — see the output above."
     mkdir -p "$BUILD_ROOT/filebrowser"
-    cp "$BUILD_ROOT/filebrowser-src/filebrowser" "$BUILD_ROOT/filebrowser/" 2>/dev/null || true
+    cp "$BUILD_ROOT/filebrowser-src/filebrowser" "$BUILD_ROOT/filebrowser/"
   fi
 
   # AdGuard
   if [[ ! -x "$BUILD_ROOT/adguard/AdGuardHome" ]]; then
+    step "AdGuard Home: host build"
     info "Building AdGuard Home on the host..."
     rm -rf "$BUILD_ROOT/adguard-src"
     git clone https://github.com/AdguardTeam/AdGuardHome.git "$BUILD_ROOT/adguard-src"
-    (cd "$BUILD_ROOT/adguard-src" && make) || warn "AdGuard host build failed"
+    (cd "$BUILD_ROOT/adguard-src" && make) || fail "AdGuard Home host build (make) failed — see the output above."
     mkdir -p "$BUILD_ROOT/adguard"
-    cp "$BUILD_ROOT/adguard-src/AdGuardHome" "$BUILD_ROOT/adguard/" 2>/dev/null || true
+    cp "$BUILD_ROOT/adguard-src/AdGuardHome" "$BUILD_ROOT/adguard/"
   fi
 
   # Vaultwarden
   if [[ ! -x "$BUILD_ROOT/vaultwarden/vaultwarden" ]]; then
+    step "Vaultwarden: host build"
     info "Building Vaultwarden on the host..."
     # shellcheck disable=SC1091
     [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
     rm -rf "$BUILD_ROOT/vaultwarden-src"
     git clone --depth 1 https://github.com/dani-garcia/vaultwarden.git "$BUILD_ROOT/vaultwarden-src"
-    (cd "$BUILD_ROOT/vaultwarden-src" && cargo build --features sqlite --release) || warn "Vaultwarden host build failed"
+    (cd "$BUILD_ROOT/vaultwarden-src" && cargo build --features sqlite --release) || fail "Vaultwarden host build (cargo build) failed — see the output above."
     mkdir -p "$BUILD_ROOT/vaultwarden"
-    cp "$BUILD_ROOT/vaultwarden-src/target/release/vaultwarden" "$BUILD_ROOT/vaultwarden/" 2>/dev/null || true
+    cp "$BUILD_ROOT/vaultwarden-src/target/release/vaultwarden" "$BUILD_ROOT/vaultwarden/"
   fi
 
   ok "Host builds finished."
@@ -579,7 +610,8 @@ copy_and_run_scripts() {
   prepare_ssh "$ctid"
   local ip
   ip=$(container_ip "$ctid")
-  [[ -n "$ip" ]] || { warn "No IP for CT $ctid — skipping installs"; return 0; }
+  step "CT $ctid: network"
+  [[ -n "$ip" ]] || fail "CT $ctid has no IP address (DHCP on $BRIDGE?)."
   info "Connecting to CT $ctid at $ip via SSH..."
   ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "root@$ip" "mkdir -p $dest"
@@ -590,9 +622,11 @@ copy_and_run_scripts() {
   for entry in ${ROLE_SCRIPTS[$role]}; do
     IFS='|' read -r script svc port <<< "$entry"
     local src="$tmpdir/$script"
+    step "$svc ($script) in CT $ctid: copy installer"
     fetch_installer "$script" "$src"
     scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "$src" "root@$ip:$dest/$script" || { warn "Failed to copy $script"; continue; }
+      "$src" "root@$ip:$dest/$script" || fail "scp of $script to $ip failed."
+    step "$svc ($script) in CT $ctid: deploy"
     if deploy_built "$ctid" "$script"; then
       continue
     fi
@@ -602,13 +636,17 @@ copy_and_run_scripts() {
         "root@$ip" "mkdir -p /opt/immich && printf 'services:\n  immich-machine-learning:\n    profiles: [\"disabled\"]\n' > /opt/immich/docker-compose.override.yml" || \
         warn "Could not write Immich compose override"
     fi
+    step "$svc ($script) in CT $ctid ($ip): install"
     info "Running $script on $ip ..."
     # Feed a fixed set of newlines so prompts take defaults.
     # Stream output live so it does not look stuck.
     printf '\n%.0s' {1..30} | ssh -i /root/.ssh/homelab_key \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "root@$ip" "export COMPOSE_PARALLEL_LIMIT=1; chmod +x $dest/$script && cd $dest && ./$script" || \
-      warn "$script exited with an error on $ip"
+      "root@$ip" "export COMPOSE_PARALLEL_LIMIT=1; chmod +x $dest/$script && cd $dest && ./$script" || {
+      step "$svc ($script) in CT $ctid ($ip): install"
+      fail "$script exited with an error on $ip (output above)." \
+        "${INSTALLER_LOGS[$script]:+CT $ctid:${INSTALLER_LOGS[$script]} (read with: pct exec $ctid -- tail -n 100 ${INSTALLER_LOGS[$script]})}"
+    }
     if [[ "$script" == "immich-install.sh" && "$SKIP_IMMICH_ML" == "1" ]]; then
       ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         "root@$ip" "cd /opt/immich 2>/dev/null && docker compose rm -sf immich-machine-learning >/dev/null 2>&1; true" || true
@@ -948,6 +986,7 @@ main() {
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
         if [[ "$role" == "docker" ]]; then
+          step "CT $ctid ($hostname): create"
           create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 1 "$DOCKER_SWAP"
           setup_ct "$ctid" "$role"
           copy_and_run_scripts "$ctid" "$role"
@@ -973,6 +1012,7 @@ main() {
           ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null             "root@$vmip" "systemctl disable --now ssh; apt-get remove -y openssh-server" || true
           qm shutdown "$ctid" || true
         else
+          step "CT $ctid ($hostname): create"
           create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 0 512
           setup_ct "$ctid" "$role"
           copy_and_run_scripts "$ctid" "$role"
@@ -982,7 +1022,10 @@ main() {
       info "Starting all containers (SSH stays off)..."
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
-        pct start "$ctid" || true
+        step "CT $ctid ($hostname): final start"
+        if [[ "$(pct status "$ctid" 2>/dev/null)" != "status: running" ]]; then
+          pct start "$ctid" || fail "pct start $ctid failed."
+        fi
       done
       sleep 5
       print_summary
@@ -2194,8 +2237,8 @@ main "$@"
 #!/usr/bin/env bash
 #
 # Jellyfin installer / uninstaller (from source via jellyfin-packaging)
-# Detects distro, installs build deps (including Docker), clones packaging repo,
-# builds a portable Linux archive, installs it, and creates a systemd service.
+# Detects distro, installs build deps (.NET SDK + Node.js), clones packaging repo,
+# builds a portable Linux archive natively (no Docker), installs it, and creates a systemd service.
 #
 # Usage:
 #   bash jellyfin-install.sh            # install
@@ -2262,33 +2305,13 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3 python3-git python3-yaml python3-packaging docker.io curl ca-certificates
+        git python3 python3-git python3-yaml python3-packaging curl ca-certificates tar gzip
       ;;
-    dnf)
-      if ! command -v docker >/dev/null 2>&1; then
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging docker curl ca-certificates || \
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging moby-engine curl ca-certificates
-      else
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging curl ca-certificates
-      fi
-      ;;
-    pacman)
-      sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml python-packaging docker curl ca-certificates
-      ;;
-    zypper)
-      sudo zypper --non-interactive install git python3 python3-GitPython python3-PyYAML python3-packaging docker curl ca-certificates
-      ;;
-    apk)
-      sudo apk add --no-cache git python3 py3-gitpython py3-yaml py3-packaging docker curl ca-certificates
-      ;;
+    dnf)    sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging curl ca-certificates tar gzip ;;
+    pacman) sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml python-packaging curl ca-certificates tar gzip ;;
+    zypper) sudo zypper --non-interactive install git python3 python3-GitPython python3-PyYAML python3-packaging curl ca-certificates tar gzip ;;
+    apk)    sudo apk add --no-cache git python3 py3-gitpython py3-yaml py3-packaging curl ca-certificates tar gzip ;;
   esac
-
-  if command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable --now docker 2>/dev/null || true
-  elif command -v rc-service >/dev/null 2>&1; then
-    sudo rc-update add docker default 2>/dev/null || true
-    sudo rc-service docker start 2>/dev/null || true
-  fi
 
   ok "Dependencies ready."
 }
@@ -2334,35 +2357,105 @@ ensure_python_modules() {
 }
 
 # ── build ──────────────────────────────────────────────────────────────────
-# Returns archive path via global ARCHIVE (avoids pipefail + command-sub issues)
+# Native from-source build (no Docker). jellyfin-packaging's build.py runs
+# `docker buildx build` via os.system() and ignores its exit code; Debian's
+# docker.io has no buildx plugin and CT 201 is an unprivileged LXC without
+# keyctl, so the image is never built and the failure only shows up later as
+# "pull access denied". Instead we do exactly what portable/build.sh does in
+# that image (dotnet publish + npm run build:production), directly on the host,
+# with the same .NET / Node versions build.yaml pins for the submodule HEADs.
+BUILD_LOG="/var/log/jellyfin-build.log"
+
+# Print "KEY=VALUE" for DOTNET_VERSION / NODEJS_VERSION, mirroring build.py's
+# _determine_framework_versions (newest pinned commit that is an ancestor of HEAD).
+framework_versions() {
+  python3 - <<'PY'
+import subprocess, yaml
+from packaging.version import Version
+cfg = yaml.safe_load(open("build.yaml"))["frameworks"]
+for sub, args in cfg.items():
+    for key, pins in args.items():
+        val = None
+        for commit, v in sorted(pins.items(), key=lambda kv: Version(str(kv[1]))):
+            if subprocess.run(["git", "-C", sub, "merge-base", "--is-ancestor", commit, "HEAD"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                val = v
+        if val is not None:
+            print(f"{key}={val}")
+PY
+}
+
+install_toolchain() {
+  local dotnet_ver="$1" node_ver="$2"
+  [[ "$PKG" == "apt" ]] || die "Native Jellyfin build supports Debian/Ubuntu only (detected $ID). Install dotnet-sdk-$dotnet_ver and Node.js $node_ver manually, then rerun."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local msid="$ID" msver="$VERSION_ID"
+  [[ "$msid" == "debian" ]] && msver="${VERSION_ID%%.*}"
+  if ! dotnet --list-sdks 2>/dev/null | grep -q "^${dotnet_ver}\."; then
+    info "Installing .NET SDK $dotnet_ver (packages.microsoft.com)..."
+    curl -fsSL "https://packages.microsoft.com/config/${msid}/${msver}/packages-microsoft-prod.deb" -o /tmp/packages-microsoft-prod.deb \
+      || die "Could not download Microsoft repo config for ${msid} ${msver}."
+    sudo dpkg -i /tmp/packages-microsoft-prod.deb
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "dotnet-sdk-${dotnet_ver}" \
+      || die "apt could not install dotnet-sdk-${dotnet_ver}."
+  fi
+  if [[ "$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')" != "$node_ver" ]]; then
+    info "Installing Node.js $node_ver (NodeSource)..."
+    curl -fsSL "https://deb.nodesource.com/setup_${node_ver}.x" -o /tmp/nodesource-setup.sh \
+      || die "Could not download NodeSource setup for Node.js $node_ver."
+    sudo bash /tmp/nodesource-setup.sh
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs || die "apt could not install nodejs $node_ver."
+  fi
+  ok "Toolchain: .NET $(dotnet --version), Node $(node -v), npm $(npm -v)"
+}
+
+# Returns archive path via global ARCHIVE
 build_jellyfin() {
   info "Cloning jellyfin-packaging..."
   rm -rf "$BUILD_DIR"
   git clone --depth 1 "$REPO_URL" "$BUILD_DIR"
   cd "$BUILD_DIR"
 
-  info "Initializing submodules..."
-  git submodule update --init
+  info "Initializing submodules (jellyfin-server, jellyfin-web)..."
+  git submodule update --init jellyfin-server jellyfin-web
 
   ensure_python_modules
-  info "Building portable Linux archive (this can take several minutes)..."
-  if docker info >/dev/null 2>&1; then
-    ./build.py auto linux amd64 || true
-  else
-    sudo ./build.py auto linux amd64 || true
-  fi
+  local DOTNET_VERSION=8.0 NODEJS_VERSION=20 kv
+  while IFS= read -r kv; do
+    case "$kv" in
+      DOTNET_VERSION=*) DOTNET_VERSION="${kv#*=}" ;;
+      NODEJS_VERSION=*) NODEJS_VERSION="${kv#*=}" ;;
+    esac
+  done < <(framework_versions)
+  info "Framework versions from build.yaml: .NET $DOTNET_VERSION, Node $NODEJS_VERSION"
+  install_toolchain "$DOTNET_VERSION" "$NODEJS_VERSION"
 
-  # Safe archive lookup (no pipefail issues)
-  ARCHIVE=""
-  local f
-  for f in out/linux/jellyfin_*-amd64.tar.xz out/linux/jellyfin_*-amd64.tar.gz; do
-    if [[ -f "$f" ]]; then
-      ARCHIVE="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
-      break
-    fi
-  done
+  local stage="$BUILD_DIR/stage/jellyfin" version
+  version="$(date +%Y%m%d%H)"
+  rm -rf "$BUILD_DIR/stage" && mkdir -p "$stage" "$BUILD_DIR/out/linux"
+  sudo touch "$BUILD_LOG" && sudo chown "$USER" "$BUILD_LOG" && : > "$BUILD_LOG"
+  info "Building Jellyfin from source (several minutes; full log: $BUILD_LOG)..."
+  export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+  export NODE_OPTIONS="--max-old-space-size=2048"
 
-  [[ -n "$ARCHIVE" ]] || die "Build finished but no archive found in out/linux/"
+  info "[1/3] dotnet publish jellyfin-server..."
+  (cd jellyfin-server && dotnet publish Jellyfin.Server --configuration Release \
+      --self-contained --runtime linux-x64 --output "$stage" \
+      -p:DebugSymbols=false -p:DebugType=none -p:UseAppHost=true) >>"$BUILD_LOG" 2>&1 \
+    || { tail -n 40 "$BUILD_LOG" >&2; die "dotnet publish (jellyfin-server) failed. See $BUILD_LOG"; }
+
+  info "[2/3] npm ci + build jellyfin-web..."
+  (cd jellyfin-web && npm ci --no-audit --unsafe-perm && npm run build:production \
+      && rm -rf "$stage/jellyfin-web" && mv dist "$stage/jellyfin-web") >>"$BUILD_LOG" 2>&1 \
+    || { tail -n 40 "$BUILD_LOG" >&2; die "jellyfin-web build failed. See $BUILD_LOG"; }
+
+  info "[3/3] Packing archive..."
+  ARCHIVE="$BUILD_DIR/out/linux/jellyfin_${version}-amd64.tar.gz"
+  tar -C "$BUILD_DIR/stage" -czf "$ARCHIVE" jellyfin/ || die "Could not create $ARCHIVE"
+  [[ -x "$stage/jellyfin" && -f "$stage/jellyfin-web/index.html" ]] \
+    || die "Build produced an incomplete tree (missing jellyfin binary or web UI). See $BUILD_LOG"
   info "Build complete: $ARCHIVE"
 }
 
@@ -2443,14 +2536,14 @@ remove_build_dir() {
 }
 
 remove_packages() {
-  if ask_yn "Also remove build packages (git, python3, docker, etc.)? (may affect other software)"; then
+  if ask_yn "Also remove build packages (git, python3, dotnet, nodejs, etc.)? (may affect other software)"; then
     info "Removing packages..."
     case "$PKG" in
-      apt)    sudo apt-get remove -y git python3 python3-git python3-yaml python3-packaging docker.io || true ;;
-      dnf)    sudo dnf remove -y git python3 python3-GitPython python3-pyyaml python3-packaging docker || true ;;
-      pacman) sudo pacman -Rns --noconfirm git python python-gitpython python-pyyaml python-packaging docker || true ;;
-      zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML python3-packaging docker || true ;;
-      apk)    sudo apk del git python3 py3-gitpython py3-yaml py3-packaging docker || true ;;
+      apt)    sudo apt-get remove -y git python3 python3-git python3-yaml python3-packaging dotnet-sdk-* nodejs || true ;;
+      dnf)    sudo dnf remove -y git python3 python3-GitPython python3-pyyaml python3-packaging || true ;;
+      pacman) sudo pacman -Rns --noconfirm git python python-gitpython python-pyyaml python-packaging || true ;;
+      zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML python3-packaging || true ;;
+      apk)    sudo apk del git python3 py3-gitpython py3-yaml py3-packaging || true ;;
     esac
     ok "Package removal finished."
   else
