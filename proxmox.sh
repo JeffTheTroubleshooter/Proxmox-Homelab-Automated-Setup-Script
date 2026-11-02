@@ -6,7 +6,7 @@
 #
 # Usage (on the Proxmox host):
 #   bash proxmox.sh            # create + install everything
-#   bash proxmox.sh destroy    # remove the 4 containers
+#   bash proxmox.sh destroy    # remove the 4 containers, TrueNAS VM, and ask about host packages
 #
 # Containers:
 #   200 docker-stack   Immich, Nextcloud, RomM, Nginx Proxy Manager
@@ -654,13 +654,26 @@ remove_packages_in_ct() {
   local ctid="$1" role="$2"
   local pkgs=""
   case "$role" in
-    docker) pkgs="sudo docker-ce docker-ce-cli containerd.io docker-compose-plugin openssh-server" ;;
-    source) pkgs="sudo git gcc g++ make nodejs npm golang openssh-server" ;;
-    light)  pkgs="sudo git xz-utils openssh-server" ;;
-    forge)  pkgs="sudo python3 git openssh-server" ;;
+    docker)
+      info "Stopping Docker stacks and removing service data in CT $ctid..."
+      pct exec "$ctid" -- bash -c '
+        if command -v docker >/dev/null 2>&1; then
+          for d in /opt/immich-app /opt/nextcloud /opt/romm /opt/nginx-proxy-manager /opt/*; do
+            [[ -f "$d/docker-compose.yml" ]] && (cd "$d" && docker compose down -v) || true
+          done
+          docker ps -aq | xargs -r docker rm -f || true
+          docker volume prune -f || true
+        fi
+        rm -rf /opt/immich-app /opt/nextcloud /opt/romm /opt/nginx-proxy-manager /var/lib/docker
+      ' >/dev/null 2>&1 || true
+      pkgs="docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin openssh-server"
+      ;;
+    source) pkgs="git gcc g++ make nodejs npm golang openssh-server" ;;
+    light)  pkgs="git xz-utils openssh-server" ;;
+    forge)  pkgs="python3 git openssh-server" ;;
   esac
   info "Removing packages in CT $ctid ($role)..."
-  pct exec "$ctid" -- bash -c "apt-get remove -y $pkgs" >/dev/null 2>&1 || true
+  pct exec "$ctid" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get remove -y $pkgs; apt-get autoremove -y" >/dev/null 2>&1 || true
   ok "Packages removed in CT $ctid"
 }
 
@@ -670,12 +683,12 @@ destroy_all() {
   check_host
   for entry in "${CONTAINERS[@]}"; do
     IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
-    if [[ "$role" == "docker" ]] && qm status "$ctid" >/dev/null 2>&1; then
-      info "Removing Docker VM $ctid..."
+    # leftover from the old Docker-VM attempt
+    if qm status "$ctid" >/dev/null 2>&1; then
+      info "Removing leftover VM $ctid..."
       qm stop "$ctid" 2>/dev/null || true
       qm destroy "$ctid" --purge || true
-      ok "Docker VM $ctid removed."
-      continue
+      ok "VM $ctid removed."
     fi
     if pct status "$ctid" >/dev/null 2>&1; then
       # clear a stuck lock before doing anything
@@ -791,8 +804,11 @@ main() {
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
         if [[ "$role" == "docker" ]]; then
-          create_docker_vm "$ctid" "$hostname" "$cores" "$memory" "$disk"
-          continue
+          create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 1
+          setup_ct "$ctid" "$role"
+          copy_and_run_scripts "$ctid" "$role"
+          lock_down "$ctid"
+        elif false; then
           local vmip
           vmip=$(wait_for_vm "$ctid") || die "Docker VM $ctid did not get an IP"
           info "Docker VM is at $vmip"
@@ -820,17 +836,12 @@ main() {
         fi
       done
       setup_truenas
-      info "Starting all containers and the Docker VM (SSH stays off)..."
+      info "Starting all containers (SSH stays off)..."
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
-        if [[ "$role" == "docker" ]]; then
-          qm start "$ctid" || true
-        else
-          pct start "$ctid" || true
-        fi
+        pct start "$ctid" || true
       done
       sleep 5
-      print_vm_guide
       print_summary
       ;;
     *)
