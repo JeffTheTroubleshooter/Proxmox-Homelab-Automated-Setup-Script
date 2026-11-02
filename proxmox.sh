@@ -38,8 +38,6 @@ PASSWORD="admin"
 TRUENAS_ISO_URL="https://download.sys.truenas.net/TrueNAS-SCALE-Goldeye/25.10.7/TrueNAS-SCALE-25.10.7.iso"
 TRUENAS_ISO="TrueNAS-SCALE-25.10.7.iso"
 TRUENAS_VMID=100
-UBUNTU_ISO_URL="https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-live-server-amd64.iso"
-UBUNTU_ISO="ubuntu-26.04.1-live-server-amd64.iso"
 
 # Return the first free ID at or above $1.
 next_free_id() {
@@ -248,65 +246,6 @@ create_ct() {
     --tags "$GUEST_TAG"
   record_id ct "$ctid"
   ok "CT $ctid created."
-}
-
-create_docker_vm() {
-  local vmid="$1" hostname="$2" cores="$3" memory="$4" disk="$5"
-  local iso_dir="/var/lib/vz/template/iso"
-
-  mkdir -p "$iso_dir"
-  if [[ ! -f "$iso_dir/$UBUNTU_ISO" ]]; then
-    info "Downloading Ubuntu Server ISO..."
-    curl -fL --progress-bar -o "$iso_dir/$UBUNTU_ISO" "$UBUNTU_ISO_URL" || die "Ubuntu ISO download failed"
-  fi
-  ok "ISO ready: $iso_dir/$UBUNTU_ISO"
-
-  if qm status "$vmid" >/dev/null 2>&1; then
-    warn "Docker VM $vmid already exists — skipping create"
-    return 0
-  fi
-
-  info "Creating Docker VM $vmid ($hostname) with Ubuntu Server ISO"
-  qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" \
-    --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26 \
-    --cpu host --tags "$GUEST_TAG"
-  record_id vm "$vmid"
-  qm set "$vmid" --scsi0 "${STORAGE}:${disk}"
-  qm set "$vmid" --ide2 "local:iso/${UBUNTU_ISO},media=cdrom"
-  qm set "$vmid" --boot order=ide2
-  ok "Docker VM $vmid created. Install Ubuntu Server from the console."
-}
-
-print_vm_guide() {
-  echo
-  echo "========================================"
-  echo "  Docker VM install guide"
-  echo "========================================"
-  echo
-  echo "The Docker VM is created with the Ubuntu Server ISO attached."
-  echo "Terminal only. No desktop."
-  echo
-  echo "1. Start it:  qm start 200"
-  echo "2. Open the console in the Proxmox UI (VM 200 -> Console)"
-  echo "3. Install Ubuntu Server:"
-  echo "     - Network: DHCP"
-  echo "     - Storage: use the entire disk"
-  echo "     - Name: docker    Password: admin"
-  echo "     - Skip Ubuntu Pro"
-  echo "     - Install OpenSSH server: YES"
-  echo "     - Featured snaps: skip all"
-  echo "4. After reboot, remove the ISO so it boots the disk:"
-  echo "     qm set 200 --ide2 none,media=cdrom"
-  echo "     qm set 200 --boot order=scsi0"
-  echo "     qm reboot 200"
-  echo "5. SSH in and install Docker:"
-  echo "     ssh docker@<vm-ip>"
-  echo "     curl -fsSL https://get.docker.com | sudo sh"
-  echo "     sudo usermod -aG docker docker"
-  echo "6. Copy and run: immich, nextcloud, romm, npm install scripts"
-  echo
-  echo "Change the password after install: passwd"
-  echo
 }
 
 setup_ct() {
@@ -987,9 +926,9 @@ destroy_all() {
     ok "Removed $BUILD_ROOT"
   fi
 
-  read -r -p "Remove downloaded ISOs (Ubuntu, TrueNAS) from /var/lib/vz/template/iso? [y/N]: " ans
+  read -r -p "Remove downloaded TrueNAS ISO from /var/lib/vz/template/iso? [y/N]: " ans
   if [[ "${ans,,}" == "y" ]]; then
-    rm -f "/var/lib/vz/template/iso/$UBUNTU_ISO" "/var/lib/vz/template/iso/$TRUENAS_ISO"
+    rm -f "/var/lib/vz/template/iso/$TRUENAS_ISO"
     ok "ISOs removed."
   fi
 
