@@ -6,7 +6,9 @@
 #
 # Usage (on the Proxmox host):
 #   bash proxmox.sh            # create + install everything
-#   bash proxmox.sh destroy    # remove the 4 containers, TrueNAS VM, and ask about host packages
+#   bash proxmox.sh destroy    # remove only guests this script created (tagged homelab-script)
+#   bash <(curl -fsSL <raw proxmox.sh URL>)   # run straight from GitHub
+#   curl -fsSL <raw proxmox.sh URL> | bash    # also works (re-downloads itself to /tmp)
 #
 # Containers:
 #   200 docker-stack   Immich, Nextcloud, RomM, Nginx Proxy Manager
@@ -18,6 +20,20 @@
 set -euo pipefail
 
 START_TIME=$(date +%s)
+
+# Base for raw downloads: $REPO_BASE/<Repo>/main/<file>
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/JeffTheTroubleshooter}"
+SCRIPT_REPO="Proxmox-Homelab-Automated-Setup-Script"
+
+# State kept on the host so destroy only touches what this script made.
+STATE_DIR="/root/.homelab-script"
+IDS_FILE="$STATE_DIR/ids"                 # lines: "ct 200" / "vm 100"
+HOST_PKGS_FILE="$STATE_DIR/host-packages" # host packages newly installed by this script
+RUST_MARKER="$STATE_DIR/rust-installed"   # present if this script installed rustup
+GUEST_TAG="homelab-script"
+SKIP_IMMICH_ML=0
+SELF=""                                   # readable path to this script (set by resolve_self)
+
 PASSWORD="admin"
 TRUENAS_ISO_URL="https://download.sys.truenas.net/TrueNAS-SCALE-Goldeye/25.10.7/TrueNAS-SCALE-25.10.7.iso"
 TRUENAS_ISO="TrueNAS-SCALE-25.10.7.iso"
@@ -38,7 +54,7 @@ STORAGE="local-lvm"
 TEMPLATE=""
 
 CONTAINERS=(
-  "200|docker-stack|2|1536|20|docker|2"
+  "200|docker-stack|2|2048|40|docker|2"   # RAM/cores/disk auto-sized by size_docker_ct
   "201|source-stack|4|3072|16|source|4"
   "202|light-stack|1|768|8|light|1"
   "203|forgepanel|1|384|4|forge|1"
@@ -53,13 +69,131 @@ declare -A ROLE_SCRIPTS=(
 )
 
 # Raw URL of this script on GitHub. Override with UPDATE_URL=... if the repo path differs.
-UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/JeffTheTroubleshooter/Proxmox-Homelab-Automated-Setup-Script/main/proxmox.sh}"
+UPDATE_URL="${UPDATE_URL:-$REPO_BASE/$SCRIPT_REPO/main/proxmox.sh}"
+
+# installer script -> its standalone GitHub repo (fetched first, embedded copy is the fallback)
+declare -A APP_REPOS=(
+  [jellyfin-install.sh]="Jellyfin-Automated-Setup-Script"
+  [navidrome-install.sh]="Navidrome-Automated-Setup-Script"
+  [vaultwarden-install.sh]="Vaultwarden-Automated-Setup-Script"
+  [adguard-install.sh]="AdGuard-Home-Automated-Setup-Script"
+  [filebrowser-install.sh]="FileBrowser-Automated-Setup-Script"
+  [trilium-install.sh]="Trilium-Automated-Setup-Script"
+  [immich-install.sh]="Immich-Automated-Setup-Script"
+  [nextcloud-install.sh]="Nextcloud-Automated-Setup-Script"
+  [romm-install.sh]="RomM-Automated-Setup-Script"
+  [npm-install.sh]="Nginx-Proxy-Manager-Automated-Setup-Script"
+)
 
 die()  { echo -e "\n\033[1;31mError:\033[0m $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*" >&2; }
 ok()   { echo -e "\033[1;32m==>\033[0m $*" >&2; }
 warn() { echo -e "\033[1;33m==>\033[0m $*" >&2; }
 elapsed() { local e=$(date +%s); printf '%dm %ds' $(((e-START_TIME)/60)) $(((e-START_TIME)%60)); }
+
+# Find a readable copy of this script (needed for the embedded installers).
+# Works for: bash proxmox.sh, bash <(curl ...), and curl ... | bash.
+resolve_self() {
+  local marker='###END forgepanel-install.sh'
+  if [[ -f "$0" && -r "$0" ]] && grep -qxF "$marker" "$0" 2>/dev/null; then
+    SELF="$0"
+    return 0
+  fi
+  local tmp="/tmp/homelab-proxmox.sh"
+  # bash <(curl ...): $0 is /dev/fd/NN. Try to save what is left of it.
+  if [[ "$0" == /dev/fd/* || "$0" == /proc/self/fd/* ]] && [[ -r "$0" ]]; then
+    cat "$0" > "$tmp" 2>/dev/null || true
+    if grep -qxF "$marker" "$tmp" 2>/dev/null && head -1 "$tmp" | grep -q '^#!'; then
+      SELF="$tmp"
+      return 0
+    fi
+  fi
+  # curl | bash (or the fd was already drained): download a full copy and re-run it.
+  if [[ "${HOMELAB_REEXEC:-0}" == "1" ]]; then
+    die "Could not find a readable copy of this script. Download proxmox.sh and run: bash proxmox.sh"
+  fi
+  info "Running from a pipe — downloading a full copy of proxmox.sh to $tmp ..."
+  if ! curl -fsSL -o "$tmp" "$UPDATE_URL" || ! grep -qxF "$marker" "$tmp"; then
+    die "Could not download $UPDATE_URL (repo private or offline?). Download proxmox.sh and run: bash proxmox.sh"
+  fi
+  chmod +x "$tmp"
+  export HOMELAB_REEXEC=1 HOMELAB_PIPED=1
+  if [[ ! -t 0 ]] && { : </dev/tty; } 2>/dev/null; then
+    exec bash "$tmp" "$@" </dev/tty
+  fi
+  exec bash "$tmp" "$@"
+}
+
+record_id() {
+  local type="$1" id="$2"
+  mkdir -p "$STATE_DIR"
+  touch "$IDS_FILE"
+  grep -qx "$type $id" "$IDS_FILE" || echo "$type $id" >> "$IDS_FILE"
+}
+
+# True if guest <type> <id> exists and carries the homelab-script tag.
+has_tag() {
+  local type="$1" id="$2" cfg
+  if [[ "$type" == "ct" ]]; then
+    cfg=$(pct config "$id" 2>/dev/null) || return 1
+  else
+    cfg=$(qm config "$id" 2>/dev/null) || return 1
+  fi
+  grep -E '^tags:' <<< "$cfg" | grep -qE "(^tags:|[ ;,])${GUEST_TAG}([ ;,]|\$)"
+}
+
+# Size the Docker CT from host RAM/CPU. Sets DOCKER_MEM / DOCKER_CORES / SKIP_IMMICH_ML.
+DOCKER_MEM=2048
+DOCKER_CORES=2
+DOCKER_SWAP=2048
+DOCKER_DISK=40
+size_docker_ct() {
+  local total_mb cpus mem cores ans
+  total_mb=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+  [[ "$total_mb" =~ ^[0-9]+$ && "$total_mb" -gt 0 ]] || total_mb=$(free -m | awk '/^Mem:/ {print $2}')
+  cpus=$(nproc 2>/dev/null || echo 2)
+
+  # memory = clamp(total/3, 2048, 6144), rounded to the nearest 256 MB
+  mem=$(( (total_mb / 3 + 128) / 256 * 256 ))
+  (( mem < 2048 )) && mem=2048
+  (( mem > 6144 )) && mem=6144
+  # cores = min(4, nproc/2), at least 2
+  cores=$(( cpus / 2 ))
+  (( cores > 4 )) && cores=4
+  (( cores < 2 )) && cores=2
+  DOCKER_MEM="$mem"
+  DOCKER_CORES="$cores"
+  info "Host: ${total_mb} MB RAM, ${cpus} CPUs -> docker-stack: ${DOCKER_MEM} MB RAM, ${DOCKER_SWAP} MB swap, ${DOCKER_CORES} cores, ${DOCKER_DISK}G disk"
+
+  if (( total_mb < 8192 )); then
+    warn "This host has less than 8 GB RAM (${total_mb} MB). Immich/Nextcloud may run out of memory."
+    read -rp "Continue anyway? [y/N]: " ans
+    [[ "${ans,,}" == y* ]] || die "Stopped. Add RAM or remove services, then re-run."
+  fi
+  if (( total_mb < 16384 )); then
+    read -rp "Host has under 16 GB RAM. Skip the Immich machine-learning container (face/smart search)? [Y/n]: " ans
+    ans="${ans:-y}"
+    if [[ "${ans,,}" == y* ]]; then
+      SKIP_IMMICH_ML=1
+      info "Immich machine-learning will be disabled."
+    fi
+  fi
+}
+
+# Get an installer: try its GitHub repo first, fall back to the copy embedded here.
+fetch_installer() {
+  local script="$1" dest="$2" repo="${APP_REPOS[$1]:-}"
+  if [[ -n "$repo" ]]; then
+    local url="$REPO_BASE/$repo/main/$script"
+    if curl -fsSL --max-time 30 -o "$dest" "$url" 2>/dev/null && [[ -s "$dest" ]] && head -1 "$dest" | grep -q '^#!'; then
+      chmod +x "$dest"
+      ok "Fetched $script from $repo"
+      return 0
+    fi
+    info "Could not fetch $script from $repo — using the embedded copy."
+  fi
+  extract_script "$script" "$dest"
+}
 
 check_host() {
   command -v pct >/dev/null 2>&1 || die "pct not found. Run this on a Proxmox host."
@@ -81,10 +215,10 @@ ensure_template() {
 }
 
 create_ct() {
-  local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5" cpulimit="$6" privileged="${7:-0}"
+  local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5" cpulimit="$6" privileged="${7:-0}" swap="${8:-512}"
   if pct status "$ctid" >/dev/null 2>&1; then
     warn "CT $ctid already exists — updating limits."
-    pct set "$ctid" --cores "$cores" --memory "$memory" --cpulimit "$cpulimit" || true
+    pct set "$ctid" --cores "$cores" --memory "$memory" --swap "$swap" --cpulimit "$cpulimit" || true
     return 0
   fi
   # Docker in an unprivileged container falls back to fuse-overlayfs and
@@ -93,7 +227,7 @@ create_ct() {
   local unpriv=1 features="nesting=1"
   if [[ "$privileged" == "1" ]]; then
     unpriv=0
-    features="nesting=1,keyctl=1,fuse=1"
+    features="nesting=1,keyctl=1"
     info "Creating privileged CT $ctid ($hostname) for Docker"
   else
     info "Creating CT $ctid ($hostname) — ${cores} cores, ${memory}MB"
@@ -102,7 +236,7 @@ create_ct() {
     --hostname "$hostname" \
     --cores "$cores" \
     --memory "$memory" \
-    --swap 256 \
+    --swap "$swap" \
     --cpulimit "$cpulimit" \
     --cpuunits 1024 \
     --rootfs "${STORAGE}:${disk}" \
@@ -110,7 +244,9 @@ create_ct() {
     --password "$PASSWORD" \
     --unprivileged "$unpriv" \
     --features "$features" \
-    --onboot 1
+    --onboot 1 \
+    --tags "$GUEST_TAG"
+  record_id ct "$ctid"
   ok "CT $ctid created."
 }
 
@@ -133,7 +269,8 @@ create_docker_vm() {
   info "Creating Docker VM $vmid ($hostname) with Ubuntu Server ISO"
   qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" \
     --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26 \
-    --cpu host
+    --cpu host --tags "$GUEST_TAG"
+  record_id vm "$vmid"
   qm set "$vmid" --scsi0 "${STORAGE}:${disk}"
   qm set "$vmid" --ide2 "local:iso/${UBUNTU_ISO},media=cdrom"
   qm set "$vmid" --boot order=ide2
@@ -191,9 +328,17 @@ setup_ct() {
         apt-get update -qq
         apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         systemctl enable --now docker
+        mkdir -p /etc/docker
+        printf "%s\n" "{\"storage-driver\":\"overlay2\",\"max-concurrent-downloads\":2,\"log-driver\":\"local\"}" > /etc/docker/daemon.json
+        systemctl restart docker || true
         systemctl enable --now ssh
       '
-      ok "Docker ready in CT $ctid"
+      local driver
+      driver=$(pct exec "$ctid" -- docker info -f '{{.Driver}}' 2>/dev/null || true)
+      if [[ "$driver" != "overlay2" ]]; then
+        die "Docker in CT $ctid is not using overlay2 (got: '${driver:-docker not running}'). Check /etc/docker/daemon.json and 'journalctl -u docker' inside CT $ctid."
+      fi
+      ok "Docker ready in CT $ctid (storage driver: overlay2)"
       ;;
     source)
       info "Installing build tools in CT $ctid..."
@@ -255,7 +400,7 @@ extract_script() {
     $0 == "###BEGIN " name {p=1; next}
     $0 == "###END " name {p=0}
     p {print}
-  ' "$0" > "$dest"
+  ' "$SELF" > "$dest"
   [[ -s "$dest" ]] || die "Embedded script missing: $name"
   chmod +x "$dest"
 }
@@ -266,6 +411,10 @@ BUILD_ROOT="/root/homelab-builds"
 
 host_deps() {
   info "Installing host build tools..."
+  mkdir -p "$STATE_DIR"
+  local before
+  before=$(mktemp)
+  dpkg-query -W -f='${Package}\n' 2>/dev/null | sort -u > "$before" || true
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git curl ca-certificates tar gcc g++ make pkg-config \
@@ -286,7 +435,16 @@ host_deps() {
   if ! command -v cargo >/dev/null 2>&1; then
     info "Installing Rust on the host..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    mkdir -p "$STATE_DIR" && touch "$RUST_MARKER"
   fi
+  # remember which host packages are new (installed by this script)
+  local after
+  after=$(mktemp)
+  dpkg-query -W -f='${Package}\n' 2>/dev/null | sort -u > "$after" || true
+  touch "$HOST_PKGS_FILE"
+  comm -13 "$before" "$after" | cat - "$HOST_PKGS_FILE" | sort -u > "$after.merged"
+  mv "$after.merged" "$HOST_PKGS_FILE"
+  rm -f "$before" "$after"
   # shellcheck disable=SC1091
   [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
   ok "Host build tools ready."
@@ -496,19 +654,29 @@ copy_and_run_scripts() {
   for entry in ${ROLE_SCRIPTS[$role]}; do
     IFS='|' read -r script svc port <<< "$entry"
     local src="$tmpdir/$script"
-    extract_script "$script" "$src"
+    fetch_installer "$script" "$src"
     scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$src" "root@$ip:$dest/$script" || { warn "Failed to copy $script"; continue; }
     if deploy_built "$ctid" "$script"; then
       continue
+    fi
+    if [[ "$script" == "immich-install.sh" && "$SKIP_IMMICH_ML" == "1" ]]; then
+      info "Disabling Immich machine-learning (compose override)..."
+      ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@$ip" "mkdir -p /opt/immich && printf 'services:\n  immich-machine-learning:\n    profiles: [\"disabled\"]\n' > /opt/immich/docker-compose.override.yml" || \
+        warn "Could not write Immich compose override"
     fi
     info "Running $script on $ip ..."
     # Feed a fixed set of newlines so prompts take defaults.
     # Stream output live so it does not look stuck.
     printf '\n%.0s' {1..30} | ssh -i /root/.ssh/homelab_key \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "root@$ip" "chmod +x $dest/$script && cd $dest && ./$script" || \
+      "root@$ip" "export COMPOSE_PARALLEL_LIMIT=1; chmod +x $dest/$script && cd $dest && ./$script" || \
       warn "$script exited with an error on $ip"
+    if [[ "$script" == "immich-install.sh" && "$SKIP_IMMICH_ML" == "1" ]]; then
+      ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@$ip" "cd /opt/immich 2>/dev/null && docker compose rm -sf immich-machine-learning >/dev/null 2>&1; true" || true
+    fi
   done
   rm -rf "$tmpdir"
   ok "Services installed on CT $ctid ($ip)"
@@ -532,7 +700,8 @@ setup_truenas() {
 
   info "Creating TrueNAS VM $TRUENAS_VMID..."
   qm create "$TRUENAS_VMID" --name truenas --memory 4096 --cores 2 --cpu host \
-    --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26
+    --net0 virtio,bridge="$BRIDGE" --scsihw virtio-scsi-pci --ostype l26 --tags "$GUEST_TAG"
+  record_id vm "$TRUENAS_VMID"
   qm set "$TRUENAS_VMID" --scsi0 "${STORAGE}:32"
   qm set "$TRUENAS_VMID" --ide2 "local:iso/${TRUENAS_ISO},media=cdrom"
   qm set "$TRUENAS_VMID" --boot order=ide2
@@ -596,6 +765,14 @@ print_summary() {
 
 self_update() {
   local force="${1:-}"
+  if [[ "${HOMELAB_PIPED:-0}" == "1" ]]; then
+    ok "Running a fresh copy downloaded from GitHub — no self-update needed."
+    return 0
+  fi
+  if [[ "$SELF" != "$0" ]]; then
+    info "Script was not run from a saved file — skipping self-update (it runs the GitHub copy already)."
+    return 0
+  fi
   info "Checking GitHub for a newer script..."
   local tmp
   tmp=$(mktemp)
@@ -604,7 +781,7 @@ self_update() {
     rm -f "$tmp"
     return 0
   fi
-  if cmp -s "$tmp" "$0"; then
+  if cmp -s "$tmp" "$SELF"; then
     ok "Script is up to date."
     rm -f "$tmp"
     return 0
@@ -620,11 +797,11 @@ self_update() {
     ans="${ans:-n}"
   fi
   if [[ "$ans" =~ ^[Yy] ]]; then
-    cp "$0" "${0}.bak"
-    cp "$tmp" "$0"
-    chmod +x "$0"
+    cp "$SELF" "${SELF}.bak"
+    cp "$tmp" "$SELF"
+    chmod +x "$SELF"
     rm -f "$tmp"
-    ok "Updated. Backup saved as ${0}.bak"
+    ok "Updated. Backup saved as ${SELF}.bak"
     ok "Re-run the script to use the new version."
     exit 0
   fi
@@ -677,43 +854,93 @@ remove_packages_in_ct() {
   ok "Packages removed in CT $ctid"
 }
 
-destroy_all() {
-  echo "Destroying homelab containers"
-  echo "============================="
-  check_host
-  for entry in "${CONTAINERS[@]}"; do
-    IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
-    # leftover from the old Docker-VM attempt
-    if qm status "$ctid" >/dev/null 2>&1; then
-      info "Removing leftover VM $ctid..."
-      qm stop "$ctid" 2>/dev/null || true
-      qm destroy "$ctid" --purge || true
-      ok "VM $ctid removed."
-    fi
-    if pct status "$ctid" >/dev/null 2>&1; then
-      # clear a stuck lock before doing anything
-      info "Unlocking CT $ctid if locked..."
-      pct unlock "$ctid" 2>/dev/null || true
-      rm -f "/run/lock/lxc/pve-config-${ctid}.lock" "/var/lock/lxc/pve-config-${ctid}.lock" 2>/dev/null || true
-      # make sure it is running so we can remove packages
-      pct start "$ctid" >/dev/null 2>&1 || true
+# role from the CT hostname (used to clean up packages before removal)
+role_for_ct() {
+  local host
+  host=$(pct config "$1" 2>/dev/null | awk '/^hostname:/ {print $2}')
+  case "$host" in
+    docker-stack) echo docker ;;
+    source-stack) echo source ;;
+    light-stack)  echo light ;;
+    forgepanel)   echo forge ;;
+    *)            echo "" ;;
+  esac
+}
+
+destroy_guest() {
+  local type="$1" id="$2"
+  if [[ "$type" == "ct" ]]; then
+    local role
+    role=$(role_for_ct "$id")
+    pct unlock "$id" 2>/dev/null || true
+    if [[ -n "$role" ]]; then
+      pct start "$id" >/dev/null 2>&1 || true
       sleep 2
-      remove_packages_in_ct "$ctid" "$role"
-      info "Removing CT $ctid ($hostname)..."
-      pct unlock "$ctid" 2>/dev/null || true
-      pct stop "$ctid" --skiplock 2>/dev/null || pct stop "$ctid" 2>/dev/null || true
-      pct destroy "$ctid" --force 2>/dev/null || pct destroy "$ctid" || true
-      ok "CT $ctid removed."
-    else
-      warn "CT $ctid not found."
+      remove_packages_in_ct "$id" "$role"
     fi
+    info "Removing CT $id..."
+    pct stop "$id" 2>/dev/null || true
+    pct destroy "$id" --purge || { warn "Could not destroy CT $id"; return 1; }
+    ok "CT $id removed."
+  else
+    info "Removing VM $id..."
+    qm stop "$id" 2>/dev/null || true
+    qm destroy "$id" --purge || { warn "Could not destroy VM $id"; return 1; }
+    ok "VM $id removed."
+  fi
+}
+
+destroy_all() {
+  echo "Destroying homelab guests created by this script"
+  echo "================================================"
+  check_host
+  local type id ans
+  local -a targets=() keep=()
+
+  if [[ -f "$IDS_FILE" ]]; then
+    while read -r type id; do
+      [[ "$type" =~ ^(ct|vm)$ && "$id" =~ ^[0-9]+$ ]] || continue
+      if has_tag "$type" "$id"; then
+        targets+=("$type $id")
+      else
+        warn "$type $id is listed in $IDS_FILE but is missing or not tagged '$GUEST_TAG' — leaving it alone."
+      fi
+    done < "$IDS_FILE"
+  else
+    warn "$IDS_FILE not found. Looking for guests tagged '$GUEST_TAG'..."
+    for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+      if has_tag ct "$id"; then
+        read -rp "Destroy CT $id ($(pct config "$id" | awk '/^hostname:/ {print $2}'))? [y/N]: " ans
+        [[ "${ans,,}" == y* ]] && targets+=("ct $id")
+      fi
+    done
+    for id in $(qm list 2>/dev/null | awk 'NR>1 {print $1}'); do
+      if has_tag vm "$id"; then
+        read -rp "Destroy VM $id ($(qm config "$id" | awk '/^name:/ {print $2}'))? [y/N]: " ans
+        [[ "${ans,,}" == y* ]] && targets+=("vm $id")
+      fi
+    done
+  fi
+
+  if (( ${#targets[@]} == 0 )); then
+    info "No guests to remove."
+  fi
+  local t
+  for t in "${targets[@]}"; do
+    read -r type id <<< "$t"
+    destroy_guest "$type" "$id" || keep+=("$t")
   done
 
-  if qm status "$TRUENAS_VMID" >/dev/null 2>&1; then
-    info "Removing TrueNAS VM $TRUENAS_VMID..."
-    qm stop "$TRUENAS_VMID" 2>/dev/null || true
-    qm destroy "$TRUENAS_VMID" || true
-    ok "TrueNAS VM removed."
+  # rewrite the IDs file with whatever is still there
+  if [[ -f "$IDS_FILE" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    while read -r type id; do
+      if [[ "$type" == "ct" ]] && pct status "$id" >/dev/null 2>&1; then echo "$type $id"
+      elif [[ "$type" == "vm" ]] && qm status "$id" >/dev/null 2>&1; then echo "$type $id"
+      fi
+    done < "$IDS_FILE" > "$tmp"
+    if [[ -s "$tmp" ]]; then mv "$tmp" "$IDS_FILE"; else rm -f "$tmp" "$IDS_FILE"; fi
   fi
 
   # host-side leftovers
@@ -722,26 +949,36 @@ destroy_all() {
     ok "Removed host SSH key."
   fi
 
-  # host build packages — only if the user wants them gone
+  # host build packages — only the ones this script newly installed
   echo
-  echo "The script installed build tools on this Proxmox host to compile binaries:"
-  echo "  git gcc g++ make pkg-config golang build-essential libssl-dev libsqlite3-dev nodejs rust"
-  echo "These are only needed to build. Once the binaries are copied into containers you can remove them."
-  read -r -p "Remove those host build packages? [y/N]: " ans
-  if [[ "${ans,,}" == "y" ]]; then
-    info "Removing host build packages..."
-    DEBIAN_FRONTEND=noninteractive apt-get remove -y \
-      golang build-essential gcc g++ make pkg-config libssl-dev libsqlite3-dev nodejs \
-      >/dev/null 2>&1 || true
-    # rustup installs outside apt
-    if [[ -x "$HOME/.cargo/bin/rustup" ]]; then
-      "$HOME/.cargo/bin/rustup" self uninstall -y >/dev/null 2>&1 || true
-      rm -rf "$HOME/.cargo" "$HOME/.rustup"
+  if [[ -s "$HOST_PKGS_FILE" || -f "$RUST_MARKER" ]]; then
+    echo "This script newly installed these host packages to build binaries:"
+    if [[ -s "$HOST_PKGS_FILE" ]]; then
+      tr '\n' ' ' < "$HOST_PKGS_FILE" | fold -s -w 76 | sed 's/^/  /'
+      echo
     fi
-    apt-get autoremove -y >/dev/null 2>&1 || true
-    ok "Host build packages removed."
+    [[ -f "$RUST_MARKER" ]] && echo "  rust (rustup in $HOME/.cargo)"
+    echo "Packages that were already on the host before the script ran are NOT listed and will be kept."
+    read -r -p "Remove those host packages? [y/N]: " ans
+    if [[ "${ans,,}" == "y" ]]; then
+      info "Removing host packages installed by this script..."
+      if [[ -s "$HOST_PKGS_FILE" ]]; then
+        # shellcheck disable=SC2046
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y $(cat "$HOST_PKGS_FILE") >/dev/null 2>&1 || \
+          warn "Some packages could not be removed (check with apt)."
+        rm -f "$HOST_PKGS_FILE"
+      fi
+      if [[ -f "$RUST_MARKER" && -x "$HOME/.cargo/bin/rustup" ]]; then
+        "$HOME/.cargo/bin/rustup" self uninstall -y >/dev/null 2>&1 || true
+        rm -rf "$HOME/.cargo" "$HOME/.rustup"
+      fi
+      rm -f "$RUST_MARKER"
+      ok "Host packages removed."
+    else
+      info "Leaving host packages installed."
+    fi
   else
-    info "Leaving host build packages installed."
+    info "No record of host packages installed by this script — leaving host packages alone."
   fi
 
   read -r -p "Remove the host build directory $BUILD_ROOT? [y/N]: " ans
@@ -756,11 +993,12 @@ destroy_all() {
     ok "ISOs removed."
   fi
 
-  ok "Done. Containers, VM, and chosen host leftovers removed."
+  ok "Done. Guests created by this script and chosen host leftovers removed."
 }
 
 main() {
   local mode="${1:-create}"
+  resolve_self "$@"
   case "$mode" in
     destroy|remove)
       destroy_all
@@ -777,12 +1015,16 @@ main() {
       echo "=============================="
       check_host
       ensure_template
+      size_docker_ct
 
       # Assign free IDs if the defaults are taken
       local -a assigned=()
       local new_list=()
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
+        if [[ "$role" == "docker" ]]; then
+          cores="$DOCKER_CORES"; memory="$DOCKER_MEM"; disk="$DOCKER_DISK"; cpulimit="$DOCKER_CORES"
+        fi
         if pct status "$ctid" >/dev/null 2>&1 || qm status "$ctid" >/dev/null 2>&1; then
           local free
           free=$(next_free_id "$ctid")
@@ -804,7 +1046,7 @@ main() {
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
         if [[ "$role" == "docker" ]]; then
-          create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 1
+          create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 1 "$DOCKER_SWAP"
           setup_ct "$ctid" "$role"
           copy_and_run_scripts "$ctid" "$role"
           lock_down "$ctid"
@@ -819,17 +1061,17 @@ main() {
           for entry in ${ROLE_SCRIPTS[$role]}; do
             IFS="|" read -r script svc port <<< "$entry"
             src="$tmpdir/$script"
-            extract_script "$script" "$src"
+            fetch_installer "$script" "$src"
             scp -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null               "$src" "root@$vmip:/root/scripts/$script"
             info "Running $script on Docker VM $vmip"
-            printf "\n%.0s" {1..30} | ssh -i /root/.ssh/homelab_key               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null               "root@$vmip" "chmod +x /root/scripts/$script && cd /root/scripts && ./$script" ||               warn "$script failed on Docker VM"
+            printf "\n%.0s" {1..30} | ssh -i /root/.ssh/homelab_key               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null               "root@$vmip" "export COMPOSE_PARALLEL_LIMIT=1; chmod +x /root/scripts/$script && cd /root/scripts && ./$script" ||               warn "$script failed on Docker VM"
           done
           rm -rf "$tmpdir"
           # remove SSH when done
           ssh -i /root/.ssh/homelab_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null             "root@$vmip" "systemctl disable --now ssh; apt-get remove -y openssh-server" || true
           qm shutdown "$ctid" || true
         else
-          create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 0
+          create_ct "$ctid" "$hostname" "$cores" "$memory" "$disk" "$cpulimit" 0 512
           setup_ct "$ctid" "$role"
           copy_and_run_scripts "$ctid" "$role"
           lock_down "$ctid"
