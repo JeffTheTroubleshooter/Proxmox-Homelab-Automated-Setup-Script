@@ -132,7 +132,7 @@ resolve_self() {
   fi
   info "Running from a pipe — downloading a full copy of proxmox.sh to $tmp ..."
   if ! curl -fsSL -o "$tmp" "$UPDATE_URL" || ! grep -qxF "$marker" "$tmp"; then
-    die "Could not download $UPDATE_URL (repo private or offline?). Download proxmox.sh and run: bash proxmox.sh"
+    die "Could not download $UPDATE_URL (offline or GitHub unreachable?). Download proxmox.sh and run: bash proxmox.sh"
   fi
   chmod +x "$tmp"
   export HOMELAB_REEXEC=1 HOMELAB_PIPED=1
@@ -198,7 +198,8 @@ size_docker_ct() {
   fi
 }
 
-# Get an installer: try its GitHub repo first, fall back to the copy embedded here.
+# Get an installer: download it from its public GitHub repo (the source of truth);
+# fall back to the copy embedded here when offline or GitHub is unreachable.
 fetch_installer() {
   local script="$1" dest="$2" repo="${APP_REPOS[$1]:-}"
   if [[ -n "$repo" ]]; then

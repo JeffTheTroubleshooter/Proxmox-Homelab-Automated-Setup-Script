@@ -17,6 +17,22 @@ One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, i
 
 The `docker-stack` container is created **privileged** (`nesting=1,keyctl=1,fuse=1`) so Docker can use `overlay2`. In an unprivileged container Docker falls back to `fuse-overlayfs`, which unpacks image layers very slowly. The other three containers are unprivileged.
 
+## App installer repos
+
+`proxmox.sh` downloads each app's installer from its own public repo below and runs it in the app's LXC. A copy of every installer is also embedded in `proxmox.sh` and is used only if GitHub can't be reached. Each repo's script also works on its own.
+
+- **Jellyfin**: [Jellyfin-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Jellyfin-Automated-Setup-Script) (source)
+- **Navidrome**: [Navidrome-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Navidrome-Automated-Setup-Script) (source)
+- **FileBrowser**: [FileBrowser-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/FileBrowser-Automated-Setup-Script) (source)
+- **AdGuard Home**: [AdGuard-Home-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/AdGuard-Home-Automated-Setup-Script) (source)
+- **Vaultwarden**: [Vaultwarden-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Vaultwarden-Automated-Setup-Script) (source)
+- **Trilium**: [Trilium-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Trilium-Automated-Setup-Script) (prebuilt release tarball)
+- **Immich**: [Immich-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Immich-Automated-Setup-Script) (Docker)
+- **Nextcloud**: [Nextcloud-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Nextcloud-Automated-Setup-Script) (Docker)
+- **RomM**: [RomM-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/RomM-Automated-Setup-Script) (Docker)
+- **Nginx Proxy Manager**: [Nginx-Proxy-Manager-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Nginx-Proxy-Manager-Automated-Setup-Script) (Docker)
+- **ForgePanel**: [ForgePanel-Dashboard](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) (dashboard; its installer is embedded in `proxmox.sh`)
+
 ## Usage
 
 On the Proxmox host, as root:
