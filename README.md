@@ -9,7 +9,9 @@ One script, run on a Proxmox VE host, that creates 4 Debian 12 LXC containers, i
 | 200 | docker-stack | 2 | 1536 MB | 20 GB | Immich (2283), Nextcloud (8080), RomM (8081), Nginx Proxy Manager (81) |
 | 201 | source-stack | 4 | 3072 MB | 16 GB | Jellyfin (8096), Navidrome (4533), FileBrowser (8082), AdGuard Home (3000) |
 | 202 | light-stack | 1 | 768 MB | 8 GB | Vaultwarden (8000), Trilium (8083) |
-| 203 | forgepanel | 1 | 384 MB | 4 GB | ForgePanel (8084) |
+| 203 | forgepanel | 1 | 384 MB | 4 GB | ForgePanel (https://<ip>:8084) |
+
+> **ForgePanel** is served over **HTTPS** by default at `https://<forgepanel-ip>:8084` with a self-signed certificate (your browser warns once). For no warning, put it behind Nginx Proxy Manager with a real certificate.
 
 > **Note:** TrueNAS is set up manually. This script no longer creates a TrueNAS VM or downloads its ISO; create and install TrueNAS yourself in Proxmox if you want it.
 
