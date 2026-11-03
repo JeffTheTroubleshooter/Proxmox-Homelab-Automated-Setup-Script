@@ -2491,7 +2491,7 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3 python3-git python3-yaml python3-packaging curl ca-certificates tar gzip
+        git python3 python3-git python3-yaml python3-packaging curl ca-certificates tar gzip ffmpeg
       ;;
     dnf)    sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging curl ca-certificates tar gzip ;;
     pacman) sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml python-packaging curl ca-certificates tar gzip ;;
@@ -2672,7 +2672,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$bin --datadir $INSTALL_DIR/data --cachedir $INSTALL_DIR/cache --webdir $INSTALL_DIR/jellyfin-web
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
