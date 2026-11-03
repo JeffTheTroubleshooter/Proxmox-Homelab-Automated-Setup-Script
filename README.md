@@ -76,12 +76,29 @@ Every 30 seconds a long step prints its elapsed time and the last lines of its l
 
 ## Logins
 
-Generated passwords are stored in each app's `.env` (mode 600) and are never printed. The summary shows how to read them, e.g.:
+> ⚠️ **Every app gets the same default login. Change it right after the first login**, or set your own
+> before running: `HOMELAB_ADMIN_USER=me HOMELAB_ADMIN_PASS='At-Least-12-Chars' bash proxmox.sh`
+> (12+ characters, letters/digits/`._@+=-`).
 
-```bash
-pct exec 200 -- grep NEXTCLOUD_ADMIN /opt/homelab/nextcloud/.env
-pct exec 201 -- sh -c 'docker logs filebrowser 2>&1 | grep -i password'
-```
+| App | URL | User | Password |
+|---|---|---|---|
+| Immich | http://IP:2283 | admin@example.com | Homelab-Admin-2026 |
+| Nextcloud | http://IP:8080 | admin | Homelab-Admin-2026 |
+| RomM | http://IP:8081 | setup wizard on first open | |
+| Nginx Proxy Manager | http://IP:81 | admin@example.com | Homelab-Admin-2026 (older installs: changeme) |
+| Jellyfin | http://IP:8096 | admin | Homelab-Admin-2026 |
+| Navidrome | http://IP:4533 | admin | Homelab-Admin-2026 |
+| FileBrowser | http://IP:8082 | admin | Homelab-Admin-2026 |
+| AdGuard Home | http://IP:3000 | setup wizard (keep admin port 3000) | |
+| Vaultwarden | **https**://IP:8000 | create an account; `/admin` token | Homelab-Admin-2026 |
+| Trilium | http://IP:8083 | set a password on first open | |
+| ForgePanel | https://IP:8084 | admin | forgepanel |
+
+Vaultwarden uses a self-signed certificate (the web vault refuses to run without HTTPS), so accept the browser warning once.
+The script prints this table with real IPs at the end of every run.
+
+Fix logins on an existing install (keeps data): `bash proxmox.sh reset-logins`. It resets the FileBrowser and Nextcloud
+admin passwords, redeploys Vaultwarden with HTTPS, and creates the Immich/Navidrome/Jellyfin admin if none exists yet.
 
 ## Security note
 

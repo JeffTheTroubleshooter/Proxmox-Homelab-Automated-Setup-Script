@@ -8,6 +8,7 @@
 # Usage (on the Proxmox host):
 #   bash proxmox.sh            # create + install everything
 #   bash proxmox.sh update     # pull newer images and recreate the apps in existing CTs
+#   bash proxmox.sh reset-logins  # reset default logins + redeploy Vaultwarden (HTTPS), keeps data
 #   bash proxmox.sh destroy    # remove only guests this script created (tagged homelab-script)
 #   bash <(curl -fsSL <raw proxmox.sh URL>)   # run straight from GitHub
 #   curl -fsSL <raw proxmox.sh URL> | bash    # also works (re-downloads itself to /tmp)
@@ -27,6 +28,7 @@
 #   HEARTBEAT_SECS=30      progress line interval
 #   APP_TIMEOUT_SECS=1800  hard limit per app install (0 = none)
 #   HEALTH_TIMEOUT=300     seconds each app gets to answer on its port
+#   HOMELAB_ADMIN_USER / HOMELAB_ADMIN_EMAIL / HOMELAB_ADMIN_PASS  default app login
 #
 
 set -Eeuo pipefail
@@ -49,7 +51,14 @@ SELF=""                                   # readable path to this script (set by
 APP_ROOT="/opt/homelab"                   # per-app compose dirs inside each CT
 END_MARKER='###END proxmox.sh'
 
-PASSWORD="admin"
+PASSWORD="admin"   # root password of every CT
+
+# Default app login, applied wherever an app allows presetting it (see the
+# login table printed at the end). At least 12 characters (FileBrowser's
+# minimum), letters/digits/._@+=- only. CHANGE IT after the first login.
+HOMELAB_ADMIN_USER="${HOMELAB_ADMIN_USER:-admin}"
+HOMELAB_ADMIN_EMAIL="${HOMELAB_ADMIN_EMAIL:-admin@example.com}"
+HOMELAB_ADMIN_PASS="${HOMELAB_ADMIN_PASS:-Homelab-Admin-2026}"
 
 # Return the first free ID at or above $1.
 next_free_id() {
@@ -460,16 +469,21 @@ services:
       - ./conf:/opt/adguardhome/conf
 YML
 }
+# HTTPS (self-signed cert in ./ssl): the web vault needs a secure context.
 compose_vaultwarden() { cat <<YML
 services:
   vaultwarden:
     image: ${VAULTWARDEN_IMAGE}
     container_name: vaultwarden
     restart: always
+    environment:
+      - ROCKET_TLS={certs="/ssl/cert.pem",key="/ssl/key.pem"}
+      - ADMIN_TOKEN=${HOMELAB_ADMIN_PASS}
     ports:
       - "8000:80"
     volumes:
       - ./data:/data
+      - ./ssl:/ssl:ro
 YML
 }
 compose_trilium() { cat <<YML
@@ -497,6 +511,9 @@ services:
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
+    environment:
+      - INITIAL_ADMIN_EMAIL=${HOMELAB_ADMIN_EMAIL}
+      - INITIAL_ADMIN_PASSWORD=${HOMELAB_ADMIN_PASS}
 YML
 }
 compose_nextcloud() { cat <<YML
@@ -619,10 +636,25 @@ compose_immich_override() {
 
 rand_secret() { openssl rand -hex 16; }
 
+# Self-signed cert for Vaultwarden (made on the host, pushed into the CT, kept on reruns).
+vaultwarden_cert() {
+  local ctid="$1" ip="$2" d="$APP_ROOT/vaultwarden/ssl" tmp
+  ct_has_file "$ctid" "$d/cert.pem" && ct_has_file "$ctid" "$d/key.pem" && return 0
+  tmp=$(mktemp -d)
+  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
+    -subj "/CN=vaultwarden" -addext "subjectAltName=IP:${ip},DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 \
+    || { rm -rf "$tmp"; fail "openssl could not create the Vaultwarden certificate."; }
+  pct exec "$ctid" -- mkdir -p "$d"
+  pct push "$ctid" "$tmp/cert.pem" "$d/cert.pem" --perms 644
+  pct push "$ctid" "$tmp/key.pem" "$d/key.pem" --perms 644
+  rm -rf "$tmp"
+  info "Vaultwarden: self-signed HTTPS certificate created."
+}
+
 # env_<app> <ip>: prints the first-run .env (secrets generated here, never shown).
 env_nextcloud() {
-  printf 'MYSQL_ROOT_PASSWORD=%s\nMYSQL_PASSWORD=%s\nNEXTCLOUD_ADMIN_USER=admin\nNEXTCLOUD_ADMIN_PASSWORD=%s\nNEXTCLOUD_TRUSTED_DOMAINS=%s localhost\n' \
-    "$(rand_secret)" "$(rand_secret)" "$(rand_secret)" "$1"
+  printf 'MYSQL_ROOT_PASSWORD=%s\nMYSQL_PASSWORD=%s\nNEXTCLOUD_ADMIN_USER=%s\nNEXTCLOUD_ADMIN_PASSWORD=%s\nNEXTCLOUD_TRUSTED_DOMAINS=%s localhost\n' \
+    "$(rand_secret)" "$(rand_secret)" "$HOMELAB_ADMIN_USER" "$HOMELAB_ADMIN_PASS" "$1"
 }
 env_romm() { printf 'DB_PASSWORD=%s\nAUTH_SECRET=%s\nIGDB_CLIENT_ID=\nIGDB_CLIENT_SECRET=\n' "$(rand_secret)" "$(openssl rand -hex 32)"; }
 
@@ -653,6 +685,10 @@ install_app() {
         sed -e "s|^DB_PASSWORD=.*|DB_PASSWORD=$(rand_secret)|" <<< "$env" | push_file "$ctid" "$dir/.env" 600
       fi
       compose_immich_override | push_file "$ctid" "$dir/docker-compose.override.yml" 644
+      ;;
+    vaultwarden)
+      vaultwarden_cert "$ctid" "$ip"
+      compose_vaultwarden | push_file "$ctid" "$dir/docker-compose.yml" 644
       ;;
     forgepanel)
       pct exec "$ctid" -- bash -c "if [ -d $dir/src/.git ]; then git -C $dir/src pull --ff-only; else rm -rf $dir/src && git clone --depth 1 '$FORGEPANEL_REPO' $dir/src; fi" \
@@ -706,7 +742,150 @@ install_role() {
 }
 
 # URL scheme a service answers on (ForgePanel is HTTPS with a self-signed cert).
-svc_scheme() { [[ "$1" == "ForgePanel" ]] && echo https || echo http; }
+svc_scheme() { [[ "$1" == "ForgePanel" || "$1" == "Vaultwarden" ]] && echo https || echo http; }
+
+# ── default logins ─────────────────────────────────────────────────────────
+check_login_config() {
+  [[ "$HOMELAB_ADMIN_PASS" =~ ^[A-Za-z0-9._@+=-]{12,}$ ]] \
+    || die "HOMELAB_ADMIN_PASS must be 12+ characters of letters, digits or ._@+=- (FileBrowser needs 12)."
+  [[ "$HOMELAB_ADMIN_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "HOMELAB_ADMIN_USER may only use letters, digits and ._-"
+  [[ "$HOMELAB_ADMIN_EMAIL" =~ ^[^[:space:]\'\"]+@[^[:space:]\'\"]+$ ]] || die "HOMELAB_ADMIN_EMAIL is not an email address."
+}
+
+# Run a command inside an app's compose dir in the CT.
+ct_compose() { local ctid="$1" app="$2"; shift 2; pct exec "$ctid" -- bash -c "cd $APP_ROOT/$app && $*"; }
+app_ct() {  # app -> ctid|ip of the CT running it ('' if none)
+  local entry ctid role item
+  for entry in "${CONTAINERS[@]}"; do
+    IFS='|' read -r ctid _ _ _ _ role _ <<< "$entry"
+    for item in ${ROLE_APPS[$role]}; do
+      [[ "${item%%|*}" == "$1" ]] && pct status "$ctid" >/dev/null 2>&1 && { printf '%s|%s' "$ctid" "$(container_ip "$ctid")"; return 0; }
+    done
+  done
+}
+
+# FileBrowser: set (or create) the admin user. Works on new and existing installs.
+login_filebrowser() {
+  local ctid="$1" u="$HOMELAB_ADMIN_USER" p="$HOMELAB_ADMIN_PASS"
+  step "FileBrowser in CT $ctid: set default login"
+  ct_compose "$ctid" filebrowser "docker compose stop filebrowser >/dev/null 2>&1
+    docker compose run --rm --no-deps -T filebrowser users update '$u' --password '$p' --perm.admin >/dev/null 2>&1 \
+      || docker compose run --rm --no-deps -T filebrowser users add '$u' '$p' --perm.admin >/dev/null 2>&1
+    rc=\$?; docker compose start filebrowser >/dev/null 2>&1; exit \$rc" \
+    || { warn "Could not set the FileBrowser login (CT $ctid: cd $APP_ROOT/filebrowser && docker compose logs filebrowser)."; return 0; }
+  ok "FileBrowser login: $u"
+}
+
+# Nextcloud: wait for the install to finish, then reset (or add) the admin.
+login_nextcloud() {
+  local ctid="$1" u="$HOMELAB_ADMIN_USER" i
+  step "Nextcloud in CT $ctid: set default login"
+  for i in $(seq 1 60); do
+    ct_compose "$ctid" nextcloud "docker compose exec -T -u www-data app php occ status --output=json 2>/dev/null" \
+      | grep -q '"installed":true' && break
+    (( i == 60 )) && { warn "Nextcloud did not finish installing within 5 minutes (CT $ctid: cd $APP_ROOT/nextcloud && docker compose logs app)."; return 0; }
+    (( i % 6 == 0 )) && info "  waiting for Nextcloud to finish installing ($((i * 5))s)"
+    sleep 5
+  done
+  ct_compose "$ctid" nextcloud "export OC_PASS='$HOMELAB_ADMIN_PASS'
+    if docker compose exec -T -u www-data app php occ user:info '$u' >/dev/null 2>&1; then
+      docker compose exec -T -u www-data -e OC_PASS app php occ user:resetpassword --password-from-env '$u'
+    else
+      docker compose exec -T -u www-data -e OC_PASS app php occ user:add --password-from-env --group admin '$u'
+    fi >/dev/null" \
+    || { warn "Could not set the Nextcloud login (occ user:resetpassword failed in CT $ctid)."; return 0; }
+  ok "Nextcloud login: $u"
+}
+
+# Apps with a first-run API: create the admin if none exists yet (best effort).
+login_firstrun() {
+  local app="$1" ip="$2" u="$HOMELAB_ADMIN_USER" p="$HOMELAB_ADMIN_PASS" e="$HOMELAB_ADMIN_EMAIL" code
+  case "$app" in
+    immich)
+      code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H 'Content-Type: application/json' \
+        -d "{\"email\":\"$e\",\"password\":\"$p\",\"name\":\"$u\"}" "http://$ip:2283/api/auth/admin-sign-up" || true)
+      case "$code" in 2*) ok "Immich admin created: $e" ;;
+        *) warn "Immich already has an admin (HTTP $code); kept it. Reset with: docker exec -it immich_server immich-admin reset-admin-password" ;; esac
+      ;;
+    navidrome)
+      code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H 'Content-Type: application/json' \
+        -d "{\"username\":\"$u\",\"password\":\"$p\"}" "http://$ip:4533/auth/createAdmin" || true)
+      case "$code" in 2*) ok "Navidrome admin created: $u" ;; *) warn "Navidrome already has an admin (HTTP $code); kept it." ;; esac
+      ;;
+    jellyfin)
+      local b="http://$ip:8096" j='Content-Type: application/json'
+      if curl -fs -m 10 "$b/Startup/Configuration" >/dev/null 2>&1; then
+        curl -fs -m 20 -H "$j" -d '{"UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' "$b/Startup/Configuration" >/dev/null 2>&1 || true
+        curl -fs -m 20 "$b/Startup/User" >/dev/null 2>&1 || true
+        if curl -fs -m 20 -H "$j" -d "{\"Name\":\"$u\",\"Password\":\"$p\"}" "$b/Startup/User" >/dev/null 2>&1 \
+           && curl -fs -m 20 -H "$j" -d '{"EnableRemoteAccess":true,"EnableAutomaticPortMapping":false}' "$b/Startup/RemoteAccess" >/dev/null 2>&1 \
+           && curl -fs -m 20 -X POST "$b/Startup/Complete" >/dev/null 2>&1; then
+          ok "Jellyfin setup wizard completed, admin: $u"
+        else
+          warn "Could not finish Jellyfin's setup wizard automatically; open Jellyfin and create the admin there."
+        fi
+      else
+        warn "Jellyfin setup wizard was already completed; kept its admin."
+      fi
+      ;;
+  esac
+}
+
+apply_logins() {
+  local app cp ctid ip
+  info "Applying default logins..."
+  for app in filebrowser nextcloud immich navidrome jellyfin; do
+    cp=$(app_ct "$app"); [[ -n "$cp" ]] || continue
+    IFS='|' read -r ctid ip <<< "$cp"
+    case "$app" in
+      filebrowser) login_filebrowser "$ctid" ;;
+      nextcloud)   login_nextcloud "$ctid" ;;
+      *)           login_firstrun "$app" "$ip" ;;
+    esac
+  done
+}
+
+# Fix logins on an existing install without destroying anything:
+# FileBrowser + Nextcloud passwords reset, Vaultwarden redeployed with HTTPS.
+reset_logins() {
+  echo "Resetting default logins (and Vaultwarden HTTPS) in existing containers"
+  echo "======================================================================="
+  check_host
+  local cp ctid ip
+  cp=$(app_ct vaultwarden)
+  if [[ -n "$cp" ]]; then
+    IFS='|' read -r ctid ip <<< "$cp"
+    pct start "$ctid" >/dev/null 2>&1 || true
+    install_app "$ctid" vaultwarden Vaultwarden "$ip"
+  fi
+  cp=$(app_ct npm)
+  if [[ -n "$cp" ]]; then
+    IFS='|' read -r ctid ip <<< "$cp"
+    install_app "$ctid" npm NginxProxyManager "$ip"
+  fi
+  apply_logins
+  health_checks
+  print_logins
+}
+
+print_logins() {
+  local u="$HOMELAB_ADMIN_USER" p="$HOMELAB_ADMIN_PASS" e="$HOMELAB_ADMIN_EMAIL" cp ip app svc port fmt='  %-20s %-30s %-20s %s\n'
+  echo
+  echo "Default logins (CHANGE THESE after the first login):"
+  # shellcheck disable=SC2059
+  printf "$fmt" APP URL USER PASSWORD
+  for item in "immich|Immich|2283|$e|$p" "nextcloud|Nextcloud|8080|$u|$p" "romm|RomM|8081|(create in setup wizard)|" \
+              "npm|NginxProxyManager|81|$e|$p" "jellyfin|Jellyfin|8096|$u|$p" "navidrome|Navidrome|4533|$u|$p" \
+              "filebrowser|FileBrowser|8082|$u|$p" "adguard|AdGuardHome|3000|(create in setup wizard)|" \
+              "vaultwarden|Vaultwarden|8000|(create an account)|admin page /admin token: $p" \
+              "trilium|Trilium|8083|(set password on first open)|" "forgepanel|ForgePanel|8084|admin|forgepanel"; do
+    IFS='|' read -r app svc port user pass <<< "$item"
+    cp=$(app_ct "$app"); ip="${cp#*|}"
+    # shellcheck disable=SC2059
+    printf "$fmt" "$svc" "$(svc_scheme "$svc")://${ip:-?}:$port" "$user" "$pass"
+  done
+  echo "  (NPM: on installs made before this version the login is admin@example.com / changeme.)"
+}
 
 # After the final start, every service must answer on its port. A 404 on "/"
 # counts as broken.
@@ -745,15 +924,13 @@ print_summary() {
   echo "  Homelab ready"
   echo "========================================"
   echo
-  local entry ctid hostname role ip item app svc port forge_ip="" docker_ct="" source_ct=""
+  local entry ctid hostname role ip item app svc port forge_ip=""
   declare -A CT_IP
   for entry in "${CONTAINERS[@]}"; do
     IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
     ip=$(container_ip "$ctid")
     CT_IP[$ctid]="$ip"
     [[ "$role" == "forge" ]] && forge_ip="$ip"
-    [[ "$role" == "docker" ]] && docker_ct="$ctid"
-    [[ "$role" == "source" ]] && source_ct="$ctid"
   done
   if [[ -n "$forge_ip" ]]; then
     echo "Open ForgePanel to see every service in one place:"
@@ -777,10 +954,9 @@ print_summary() {
     echo
   done
   echo "Each app: $APP_ROOT/<app>/ inside its CT (docker-compose.yml, .env, data)."
-  echo "Generated logins (not printed here):"
-  echo "  Nextcloud admin:    pct exec ${docker_ct:-200} -- grep NEXTCLOUD_ADMIN $APP_ROOT/nextcloud/.env"
-  echo "  FileBrowser admin:  pct exec ${source_ct:-201} -- docker logs filebrowser 2>&1 | grep -i password"
-  echo "  AdGuard Home:       finish the wizard on :3000 and keep the admin port at 3000"
+  print_logins
+  echo "  AdGuard Home: in the wizard keep the admin web port at 3000."
+  echo "  Database passwords are generated and stored in $APP_ROOT/<app>/.env (mode 600)."
   echo "Logs of this run: $LOG_DIR/"
   echo
   echo "Default root password for every container: $PASSWORD"
@@ -852,6 +1028,7 @@ service_update() {
     install_role "$ctid" "$role"
   done
   health_checks
+  apply_logins
   print_summary
 }
 
@@ -957,7 +1134,12 @@ main() {
       destroy_all
       ;;
     update)
+      check_login_config
       service_update
+      ;;
+    reset-logins)
+      check_login_config
+      reset_logins
       ;;
     self-update)
       self_update --yes
@@ -967,6 +1149,7 @@ main() {
       echo "Proxmox homelab — full install (Docker, official images)"
       echo "========================================================"
       check_host
+      check_login_config
       ensure_template
       size_docker_ct
 
@@ -1003,10 +1186,11 @@ main() {
         install_role "$ctid" "$role"
       done
       health_checks
+      apply_logins
       print_summary
       ;;
     *)
-      die "Unknown option: $mode. Use: $0 [create|update|self-update|destroy]"
+      die "Unknown option: $mode. Use: $0 [create|update|reset-logins|self-update|destroy]"
       ;;
   esac
 }
