@@ -709,9 +709,10 @@ install_app() {
   esac
 
   step "$svc in CT $ctid: pull + start"
-  local fetch="docker compose --progress plain pull"
+  # Retry pulls: registries (ghcr.io, Docker Hub) can answer "toomanyrequests" for a short while.
+  local fetch="for i in 1 2 3 4 5; do docker compose --progress plain pull && break; [ \$i = 5 ] && exit 1; echo \"pull failed (attempt \$i/5), retrying in \$((i*30))s...\"; sleep \$((i*30)); done"
   [[ "$app" == "forgepanel" ]] && fetch="docker compose --progress plain build --pull"
-  HB_CTID="$ctid" HB_KILL="docker compose" run_logged "$svc: $fetch && up -d in CT $ctid" "$log" \
+  HB_CTID="$ctid" HB_KILL="docker compose" run_logged "$svc: pull (with retry) && up -d in CT $ctid" "$log" \
     pct exec "$ctid" -- bash -c "cd $dir && docker compose config -q && $fetch && docker compose up -d --remove-orphans" \
     || fail "$svc did not start (docker compose failed in CT $ctid:$dir)." "$log"
 
