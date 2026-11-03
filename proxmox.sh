@@ -2571,6 +2571,27 @@ for sub, args in cfg.items():
 PY
 }
 
+# ver_ge A B: true if version A >= version B
+ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$2" ]]; }
+
+# jellyfin-web's package.json pins engines.npm (10.11: ">=9.6.4"). Debian 13's
+# own Node 20 is fine, but its npm is 9.2.0, so `npm ci` stops with EBADENGINE.
+# Upgrade npm in place to a pinned major that supports Node 20 when it is too old.
+NPM_PIN="${NPM_PIN:-10}"
+ensure_npm_engine() {
+  local need cur
+  need=$(python3 -c 'import json,re; e=json.load(open("jellyfin-web/package.json")).get("engines",{}).get("npm",""); m=re.search(r"[0-9]+(\.[0-9]+)*", e); print(m.group(0) if m else "")' 2>/dev/null || true)
+  [[ -n "$need" ]] || return 0
+  cur=$(npm -v 2>/dev/null || echo 0)
+  ver_ge "$cur" "$need" && return 0
+  info "npm $cur is older than $need (jellyfin-web engines); installing npm@${NPM_PIN}..."
+  sudo npm install -g "npm@${NPM_PIN}" || die "npm install -g npm@${NPM_PIN} failed."
+  hash -r
+  cur=$(npm -v 2>/dev/null || echo 0)
+  ver_ge "$cur" "$need" || die "npm is $cur after upgrading; jellyfin-web needs npm >= $need."
+  ok "npm $cur (jellyfin-web needs >= $need)"
+}
+
 install_toolchain() {
   local dotnet_ver="$1" node_ver="$2"
   [[ "$PKG" == "apt" ]] || die "Native Jellyfin build supports Debian/Ubuntu only (detected $ID). Install dotnet-sdk-$dotnet_ver and Node.js $node_ver manually, then rerun."
@@ -2594,6 +2615,7 @@ install_toolchain() {
     sudo bash /tmp/nodesource-setup.sh
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs || die "apt could not install nodejs $node_ver."
   fi
+  ensure_npm_engine
   ok "Toolchain: .NET $(dotnet --version), Node $(node -v), npm $(npm -v)"
 }
 
