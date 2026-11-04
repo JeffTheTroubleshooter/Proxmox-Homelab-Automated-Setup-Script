@@ -615,8 +615,11 @@ services:
     container_name: forgepanel
     restart: always
     command: ["--https"]
-    ports:
-      - "8084:8084"
+    # Host networking: the scanner must see the LAN (10.0.0.x), not Docker's 172.x bridge,
+    # or Scan Network finds 0 services. Serves on the CT's own IP at :8084.
+    network_mode: host
+    environment:
+      FORGEPANEL_SCAN_SUBNET: "\${FORGEPANEL_SCAN_SUBNET:-auto}"
     volumes:
       - forgepanel-data:/app/database
       - forgepanel-custom:/app/custom_services
