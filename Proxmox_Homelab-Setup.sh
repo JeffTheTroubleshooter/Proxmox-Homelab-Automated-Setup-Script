@@ -569,9 +569,15 @@ create_ct() {
 }
 
 container_ip() {
+  # Prefer the LAN address on eth0. hostname -I can list Docker's 172.17.0.1
+  # (or an IPv6 address) first, which would break Nextcloud trusted_domains
+  # and the URLs printed in the login table.
   local ctid="$1" ip=""
   for _ in $(seq 1 15); do
-    ip=$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}' || true)
+    ip=$(pct exec "$ctid" -- ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
+    if [[ -z "$ip" ]]; then
+      ip=$(pct exec "$ctid" -- hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^127\.|^172\.17\.' | head -n1 || true)
+    fi
     [[ -n "$ip" ]] && break
     sleep 2
   done
@@ -758,7 +764,7 @@ services:
       - REDIS_HOST=redis
       - NEXTCLOUD_ADMIN_USER=\${NEXTCLOUD_ADMIN_USER}
       - NEXTCLOUD_ADMIN_PASSWORD=\${NEXTCLOUD_ADMIN_PASSWORD}
-      - NEXTCLOUD_TRUSTED_DOMAINS=\${NEXTCLOUD_TRUSTED_DOMAINS}
+      - "NEXTCLOUD_TRUSTED_DOMAINS=\${NEXTCLOUD_TRUSTED_DOMAINS}"
   cron:
     image: ${NEXTCLOUD_IMAGE}
     restart: always
@@ -864,7 +870,7 @@ vaultwarden_cert() {
 
 # env_<app> <ip>: prints the first-run .env (secrets generated here, never shown).
 env_nextcloud() {
-  printf 'MYSQL_ROOT_PASSWORD=%s\nMYSQL_PASSWORD=%s\nNEXTCLOUD_ADMIN_USER=%s\nNEXTCLOUD_ADMIN_PASSWORD=%s\nNEXTCLOUD_TRUSTED_DOMAINS=%s localhost\n' \
+  printf 'MYSQL_ROOT_PASSWORD=%s\nMYSQL_PASSWORD=%s\nNEXTCLOUD_ADMIN_USER=%s\nNEXTCLOUD_ADMIN_PASSWORD=%s\nNEXTCLOUD_TRUSTED_DOMAINS=%s localhost 127.0.0.1\n' \
     "$(rand_secret)" "$(rand_secret)" "$HOMELAB_ADMIN_USER" "$HOMELAB_ADMIN_PASS" "$1"
 }
 env_romm() { printf 'DB_PASSWORD=%s\nAUTH_SECRET=%s\nIGDB_CLIENT_ID=\nIGDB_CLIENT_SECRET=\n' "$(rand_secret)" "$(openssl rand -hex 32)"; }
@@ -1029,6 +1035,20 @@ login_nextcloud() {
       docker compose exec -T -u www-data -e OC_PASS app php occ user:add --password-from-env --group admin '$u'
     fi >/dev/null" \
     || { warn "Could not set the Nextcloud login (occ user:resetpassword failed in CT $ctid)."; return 0; }
+  # NEXTCLOUD_TRUSTED_DOMAINS is only applied by the image on first install, and
+  # that step can be skipped if occ is not ready yet. Always set it here so the
+  # LAN IP (and localhost) are accepted after create and after reset-logins.
+  local ip
+  ip=$(container_ip "$ctid")
+  if [[ -n "$ip" ]]; then
+    ct_compose "$ctid" nextcloud "docker compose exec -T -u www-data app php occ config:system:set trusted_domains 0 --value=localhost &&
+      docker compose exec -T -u www-data app php occ config:system:set trusted_domains 1 --value=127.0.0.1 &&
+      docker compose exec -T -u www-data app php occ config:system:set trusted_domains 2 --value='$ip' &&
+      docker compose exec -T -u www-data app php occ config:system:set overwrite.cli.url --value='http://$ip:8080'" \
+      || { warn "Could not set Nextcloud trusted domains (CT $ctid). Opening http://$ip:8080 may show 'untrusted domain'."; }
+  else
+    warn "Nextcloud trusted domains: CT $ctid has no IP, so they were not updated."
+  fi
   ok "Nextcloud login: $u"
 }
 
@@ -1148,6 +1168,11 @@ health_checks() {
       if [[ ! "$code" =~ ^[23][0-9][0-9]$|^401$ ]]; then
         pct exec "$ctid" -- bash -c "cd $APP_ROOT/$app && docker compose ps -a && docker compose logs --tail 30 --no-color" >&2 2>/dev/null || true
         fail "$svc is not answering at $url (HTTP ${code:-000} after ${timeout}s). Check: pct exec $ctid -- bash -c 'cd $APP_ROOT/$app && docker compose logs --tail 100'"
+      fi
+      # The untrusted-domain page is still HTTP 200, so a status check alone
+      # would mark Nextcloud healthy while the browser shows the block screen.
+      if [[ "$app" == "nextcloud" ]] && curl -sk -m 10 "$url" 2>/dev/null | grep -qi 'untrusted domain'; then
+        fail "Nextcloud at $url is blocking this address as an untrusted domain. Re-run: bash ./Proxmox_Homelab-Setup.sh reset-logins"
       fi
       ok "  $svc OK  $url (HTTP $code)"
     done
