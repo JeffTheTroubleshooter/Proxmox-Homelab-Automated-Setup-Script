@@ -13,11 +13,14 @@
 #   bash <(curl -fsSL <raw proxmox.sh URL>)   # run straight from GitHub
 #   curl -fsSL <raw proxmox.sh URL> | bash    # also works (re-downloads itself to /tmp)
 #
-# Containers (each: Debian, nesting=1,keyctl=1, Docker CE + compose plugin):
-#   200 docker-stack   Immich, Nextcloud, RomM, Nginx Proxy Manager
-#   201 source-stack   Jellyfin, Navidrome, FileBrowser, AdGuard Home
-#   202 light-stack    Vaultwarden, Trilium
-#   203 forgepanel     ForgePanel dashboard
+# Containers (each: Debian, nesting=1,keyctl=1, Docker CE + compose plugin).
+# Preferred IDs below; if one is taken by a foreign CT/VM the script picks a free
+# ID via `pvesh get /cluster/nextid` and keeps a hostname→ctid map so reruns
+# stick to the same containers:
+#   docker-stack   Immich, Nextcloud, RomM, Nginx Proxy Manager   (default 200)
+#   source-stack   Jellyfin, Navidrome, FileBrowser, AdGuard Home (default 201)
+#   light-stack    Vaultwarden, Trilium                           (default 202)
+#   forgepanel     ForgePanel dashboard                           (default 203)
 #
 # Each app lives in /opt/homelab/<app>/ inside its CT (docker-compose.yml, .env,
 # data). Generated passwords are written to .env files there (mode 600) and are
@@ -29,6 +32,7 @@
 #   APP_TIMEOUT_SECS=1800  hard limit per app install (0 = none)
 #   HEALTH_TIMEOUT=300     seconds each app gets to answer on its port
 #   HOMELAB_ADMIN_USER / HOMELAB_ADMIN_EMAIL / HOMELAB_ADMIN_PASS  default app login
+#   CT_ID_DOCKER / CT_ID_SOURCE / CT_ID_LIGHT / CT_ID_FORGE  preferred CT IDs
 #
 
 set -Eeuo pipefail
@@ -42,6 +46,7 @@ SCRIPT_REPO="Proxmox-Homelab-Automated-Setup-Script"
 # State kept on the host so destroy only touches what this script made.
 STATE_DIR="/root/.homelab-script"
 IDS_FILE="$STATE_DIR/ids"                 # lines: "ct 200" / "vm 100"
+CT_MAP_FILE="$STATE_DIR/ct-map"           # lines: "hostname ctid" (stable across reruns)
 GUEST_TAG="homelab-script"
 SKIP_IMMICH_ML=0
 SELF=""                                   # readable path to this script (set by resolve_self)
@@ -57,24 +62,23 @@ HOMELAB_ADMIN_USER="${HOMELAB_ADMIN_USER:-admin}"
 HOMELAB_ADMIN_EMAIL="${HOMELAB_ADMIN_EMAIL:-admin@example.com}"
 HOMELAB_ADMIN_PASS="${HOMELAB_ADMIN_PASS:-Homelab-Admin-2026}"
 
-# Return the first free ID at or above $1.
-next_free_id() {
-  local id="$1"
-  while pct status "$id" >/dev/null 2>&1 || qm status "$id" >/dev/null 2>&1; do
-    id=$((id + 1))
-  done
-  printf '%s' "$id"
-}
+# Preferred CT IDs (override with CT_ID_DOCKER=205 etc. before running).
+CT_ID_DOCKER="${CT_ID_DOCKER:-200}"
+CT_ID_SOURCE="${CT_ID_SOURCE:-201}"
+CT_ID_LIGHT="${CT_ID_LIGHT:-202}"
+CT_ID_FORGE="${CT_ID_FORGE:-203}"
+
 BRIDGE="vmbr0"
 STORAGE="local-lvm"
 TEMPLATE=""
 
 # ctid|hostname|cores|memory MB|disk GB|role|cpulimit
+# Preferred IDs come from CT_ID_*; resolve_container_ids rewrites them before use.
 CONTAINERS=(
-  "200|docker-stack|2|2048|40|docker|2"   # RAM/cores auto-sized by size_docker_ct
-  "201|source-stack|4|3072|24|source|4"
-  "202|light-stack|1|1024|8|light|1"
-  "203|forgepanel|1|768|6|forge|1"
+  "${CT_ID_DOCKER}|docker-stack|2|2048|40|docker|2"   # RAM/cores auto-sized by size_docker_ct
+  "${CT_ID_SOURCE}|source-stack|4|3072|24|source|4"
+  "${CT_ID_LIGHT}|light-stack|1|1024|8|light|1"
+  "${CT_ID_FORGE}|forgepanel|1|768|6|forge|1"
 )
 
 # role -> "app|Service Name|port" entries (port = the one health-checked)
@@ -265,6 +269,204 @@ has_tag() {
   grep -E '^tags:' <<< "$cfg" | grep -qE "(^tags:|[ ;,])${GUEST_TAG}([ ;,]|\$)"
 }
 
+# Hostname configured on CT <id>, or empty if missing.
+ct_hostname() {
+  local id="$1"
+  pct config "$id" 2>/dev/null | awk '/^hostname:/ {print $2; exit}'
+}
+
+# True if IDS_FILE lists "<type> <id>".
+id_recorded() {
+  local type="$1" id="$2"
+  [[ -f "$IDS_FILE" ]] && grep -qx "$type $id" "$IDS_FILE"
+}
+
+# CT <id> is ours for <hostname> when recorded or its hostname matches the slot.
+ct_is_ours() {
+  local id="$1" hostname="$2"
+  id_recorded ct "$id" && return 0
+  [[ "$(ct_hostname "$id")" == "$hostname" ]]
+}
+
+# Look up a previously saved hostname→ctid mapping.
+map_get() {
+  local hostname="$1"
+  [[ -f "$CT_MAP_FILE" ]] || return 0
+  awk -v h="$hostname" '$1 == h { print $2; exit }' "$CT_MAP_FILE"
+}
+
+# Persist hostname→ctid (rewrite that hostname's line).
+map_set() {
+  local hostname="$1" id="$2" tmp
+  mkdir -p "$STATE_DIR"
+  touch "$CT_MAP_FILE"
+  tmp=$(mktemp)
+  awk -v h="$hostname" -v id="$id" '
+    $1 == h { next }
+    NF { print }
+    END { print h, id }
+  ' "$CT_MAP_FILE" > "$tmp"
+  mv "$tmp" "$CT_MAP_FILE"
+}
+
+# Drop a hostname (or ctid) from the map file.
+map_unset_id() {
+  local id="$1" tmp
+  [[ -f "$CT_MAP_FILE" ]] || return 0
+  tmp=$(mktemp)
+  awk -v id="$id" '$2 != id { print }' "$CT_MAP_FILE" > "$tmp"
+  if [[ -s "$tmp" ]]; then mv "$tmp" "$CT_MAP_FILE"; else rm -f "$tmp" "$CT_MAP_FILE"; fi
+}
+
+# First existing CT whose hostname matches <hostname>, or empty.
+find_ct_by_hostname() {
+  local hostname="$1" id
+  for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    [[ "$(ct_hostname "$id")" == "$hostname" ]] && { printf '%s' "$id"; return 0; }
+  done
+  return 0
+}
+
+# Human-readable name of whatever owns <id> (CT hostname, "VM <id>", or "ID <id>").
+id_holder_name() {
+  local id="$1" name
+  if pct status "$id" >/dev/null 2>&1; then
+    name=$(ct_hostname "$id")
+    printf '%s' "${name:-CT $id}"
+  elif qm status "$id" >/dev/null 2>&1; then
+    name=$(qm config "$id" 2>/dev/null | awk '/^name:/ {print $2; exit}')
+    printf '%s' "${name:-VM $id}"
+  else
+    printf 'ID %s' "$id"
+  fi
+}
+
+# True if a CT or VM already uses <id>.
+id_in_use() {
+  local id="$1"
+  pct status "$id" >/dev/null 2>&1 || qm status "$id" >/dev/null 2>&1
+}
+
+# True if <id> was already claimed earlier in this resolve pass.
+id_already_picked() {
+  local id="$1" x
+  for x in "${RESOLVED_IDS[@]+"${RESOLVED_IDS[@]}"}"; do
+    [[ "$x" == "$id" ]] && return 0
+  done
+  return 1
+}
+
+# Next free cluster ID via pvesh, skipping IDs already picked this run.
+# Falls back to scanning upward from 100 when pvesh is unavailable.
+allocate_free_id() {
+  local candidate="" tries=0
+  if command -v pvesh >/dev/null 2>&1; then
+    candidate=$(pvesh get /cluster/nextid 2>/dev/null | tr -d '[:space:]' || true)
+  fi
+  [[ "$candidate" =~ ^[0-9]+$ ]] || candidate=100
+  while (( tries < 10000 )); do
+    if ! id_in_use "$candidate" && ! id_already_picked "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    if command -v pvesh >/dev/null 2>&1; then
+      local next
+      next=$(pvesh get /cluster/nextid --vmid "$((candidate + 1))" 2>/dev/null | tr -d '[:space:]' || true)
+      if [[ "$next" =~ ^[0-9]+$ && "$next" -gt "$candidate" ]]; then
+        candidate="$next"
+      else
+        candidate=$((candidate + 1))
+      fi
+    else
+      candidate=$((candidate + 1))
+    fi
+    tries=$((tries + 1))
+  done
+  die "Could not find a free CT/VM ID (checked $tries candidates)."
+}
+
+# Resolve preferred CONTAINERS IDs before create/update/summary.
+# Reuses an existing CT when it is ours (IDS_FILE or matching hostname), or when
+# the hostname→ctid map / a hostname scan finds it. Otherwise, if the preferred
+# ID is free, uses it; if a foreign CT/VM holds it, allocates via pvesh nextid.
+# Set allow_new=0 (update) to only bind to existing ours; missing slots keep the
+# preferred ID so callers can skip with a warning.
+resolve_container_ids() {
+  local allow_new="${1:-1}"
+  local -a new_list=()
+  local entry want hostname cores memory disk role cpulimit resolved holder
+  RESOLVED_IDS=()
+
+  for entry in "${CONTAINERS[@]}"; do
+    IFS='|' read -r want hostname cores memory disk role cpulimit <<< "$entry"
+    resolved=""
+
+    # 1) Persistent map for this hostname
+    resolved=$(map_get "$hostname")
+    if [[ -n "$resolved" ]]; then
+      if pct status "$resolved" >/dev/null 2>&1 && ct_is_ours "$resolved" "$hostname"; then
+        :
+      else
+        resolved=""
+      fi
+    fi
+
+    # 2) Existing CT with this hostname anywhere on the node
+    if [[ -z "$resolved" ]]; then
+      resolved=$(find_ct_by_hostname "$hostname")
+    fi
+
+    # 3) Preferred ID already ours
+    if [[ -z "$resolved" ]] && pct status "$want" >/dev/null 2>&1 && ct_is_ours "$want" "$hostname"; then
+      resolved="$want"
+    fi
+
+    # 4) Preferred ID free (and not claimed this pass) → use it when creating
+    if [[ -z "$resolved" ]] && (( allow_new )); then
+      if ! id_in_use "$want" && ! id_already_picked "$want"; then
+        resolved="$want"
+      elif id_in_use "$want"; then
+        holder=$(id_holder_name "$want")
+        resolved=$(allocate_free_id)
+        warn "CT $want is in use by $holder; using $resolved for $hostname"
+      else
+        # Free but already picked for another slot this pass
+        resolved=$(allocate_free_id)
+        warn "CT $want already assigned this run; using $resolved for $hostname"
+      fi
+    fi
+
+    # Update mode with nothing found: keep preferred ID (caller skips if missing)
+    if [[ -z "$resolved" ]]; then
+      resolved="$want"
+    fi
+
+    # Avoid double-claiming the same ID for two hostnames
+    if id_already_picked "$resolved"; then
+      if (( allow_new )); then
+        local alt
+        alt=$(allocate_free_id)
+        warn "CT $resolved already assigned this run; using $alt for $hostname"
+        resolved="$alt"
+      else
+        warn "CT $resolved matched more than one slot; leaving $hostname on preferred ID $want"
+        resolved="$want"
+      fi
+    fi
+
+    # Persist map for IDs we will create (allow_new) or that already exist.
+    if (( allow_new )) || pct status "$resolved" >/dev/null 2>&1; then
+      map_set "$hostname" "$resolved"
+    fi
+    if pct status "$resolved" >/dev/null 2>&1; then
+      record_id ct "$resolved"
+    fi
+    RESOLVED_IDS+=("$resolved")
+    new_list+=("$resolved|$hostname|$cores|$memory|$disk|$role|$cpulimit")
+  done
+  CONTAINERS=("${new_list[@]}")
+}
+
 # Size the Docker CT from host RAM/CPU. Sets DOCKER_MEM / DOCKER_CORES / SKIP_IMMICH_ML.
 DOCKER_MEM=2048
 DOCKER_CORES=2
@@ -331,12 +533,20 @@ ensure_template() {
 create_ct() {
   local ctid="$1" hostname="$2" cores="$3" memory="$4" disk="$5" cpulimit="$6" swap="${7:-512}"
   if pct status "$ctid" >/dev/null 2>&1; then
+    if ! ct_is_ours "$ctid" "$hostname"; then
+      fail "CT $ctid exists but belongs to $(id_holder_name "$ctid") — refusing to modify it. Re-run after resolve picks another ID, or: bash $0 destroy"
+    fi
     if pct config "$ctid" 2>/dev/null | grep -q '^unprivileged: 1'; then
       fail "CT $ctid ($hostname) is an unprivileged CT from an older version of this script (native installs). Remove it first: bash $0 destroy (or: pct stop $ctid; pct destroy $ctid --purge), then rerun."
     fi
-    warn "CT $ctid already exists — updating limits."
+    warn "CT $ctid ($hostname) already exists — updating limits."
     pct set "$ctid" --cores "$cores" --memory "$memory" --swap "$swap" --cpulimit "$cpulimit" || true
+    record_id ct "$ctid"
+    map_set "$hostname" "$ctid"
     return 0
+  fi
+  if qm status "$ctid" >/dev/null 2>&1; then
+    fail "ID $ctid is a VM ($(id_holder_name "$ctid")) — refusing to create a CT there."
   fi
   info "Creating CT $ctid ($hostname) — ${cores} cores, ${memory}MB RAM, ${disk}G disk, Docker-ready"
   pct create "$ctid" "$TEMPLATE" \
@@ -354,6 +564,7 @@ create_ct() {
     --onboot 1 \
     --tags "$GUEST_TAG"
   record_id ct "$ctid"
+  map_set "$hostname" "$ctid"
   ok "CT $ctid created."
 }
 
@@ -875,6 +1086,7 @@ reset_logins() {
   echo "Resetting default logins (and Vaultwarden HTTPS) in existing containers"
   echo "======================================================================="
   check_host
+  resolve_container_ids 0
   local cp ctid ip
   cp=$(app_ct vaultwarden)
   if [[ -n "$cp" ]]; then
@@ -1041,6 +1253,7 @@ service_update() {
   echo "Updating apps in existing containers (pull newer images, recreate)"
   echo "=================================================================="
   check_host
+  resolve_container_ids 0
   PULL_FORCE=1   # update mode: re-pull even images already present
   local entry ctid hostname role
   for entry in "${CONTAINERS[@]}"; do
@@ -1106,13 +1319,15 @@ destroy_all() {
     destroy_guest "$type" "$id" || keep+=("$t")
   done
 
-  # rewrite the IDs file with whatever is still there
+  # rewrite the IDs file with whatever is still there; drop map entries for removed CTs
   if [[ -f "$IDS_FILE" ]]; then
     local tmp
     tmp=$(mktemp)
     while read -r type id; do
       if [[ "$type" == "ct" ]] && pct status "$id" >/dev/null 2>&1; then echo "$type $id"
       elif [[ "$type" == "vm" ]] && qm status "$id" >/dev/null 2>&1; then echo "$type $id"
+      else
+        [[ "$type" == "ct" ]] && map_unset_id "$id"
       fi
     done < "$IDS_FILE" > "$tmp"
     if [[ -s "$tmp" ]]; then mv "$tmp" "$IDS_FILE"; else rm -f "$tmp" "$IDS_FILE"; fi
@@ -1149,26 +1364,19 @@ main() {
       ensure_template
       size_docker_ct
 
-      # Assign free IDs if the defaults are taken by guests this script did not make
-      local -a assigned=() new_list=()
-      local entry ctid hostname cores memory disk role cpulimit free
+      # Prefer default/env IDs; reuse ours by hostname/map; otherwise pick a free ID.
+      resolve_container_ids 1
+
+      local entry ctid hostname cores memory disk role cpulimit
+      local -a sized=()
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"
         if [[ "$role" == "docker" ]]; then
           cores="$DOCKER_CORES"; memory="$DOCKER_MEM"; disk="$DOCKER_DISK"; cpulimit="$DOCKER_CORES"
         fi
-        if { pct status "$ctid" >/dev/null 2>&1 && ! has_tag ct "$ctid"; } || qm status "$ctid" >/dev/null 2>&1; then
-          free=$(next_free_id "$ctid")
-          while printf '%s\n' "${assigned[@]}" | grep -qx "$free"; do
-            free=$(next_free_id "$((free + 1))")
-          done
-          warn "ID $ctid is taken — using $free for $hostname"
-          ctid="$free"
-        fi
-        assigned+=("$ctid")
-        new_list+=("$ctid|$hostname|$cores|$memory|$disk|$role|$cpulimit")
+        sized+=("$ctid|$hostname|$cores|$memory|$disk|$role|$cpulimit")
       done
-      CONTAINERS=("${new_list[@]}")
+      CONTAINERS=("${sized[@]}")
 
       for entry in "${CONTAINERS[@]}"; do
         IFS='|' read -r ctid hostname cores memory disk role cpulimit <<< "$entry"

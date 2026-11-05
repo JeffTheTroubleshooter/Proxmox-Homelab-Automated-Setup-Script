@@ -4,8 +4,8 @@
 
 One script, run on a Proxmox VE host, that creates 4 Debian LXC containers (Debian 13 template, Debian 12 if 13 isn't available), installs Docker + the Compose plugin in each, runs every app from its **official Docker image**, health-checks them and prints every URL at the end. Nothing is compiled on the host or in the containers (except ForgePanel's small Python image, built from its own Dockerfile). Use [ForgePanel](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) to see them all in one place.
 
-| CT | Name | CPU | RAM | Disk | Apps (port) |
-|----|------|-----|-----|------|-------------|
+| Preferred CT | Name | CPU | RAM | Disk | Apps (port) |
+|--------------|------|-----|-----|------|-------------|
 | 200 | docker-stack | 2–4 (auto) | 2–6 GB (auto) | 40 GB | Immich (2283), Nextcloud (8080), RomM (8081), Nginx Proxy Manager (81, plus 80/443) |
 | 201 | source-stack | 4 | 3072 MB | 24 GB | Jellyfin (8096), Navidrome (4533), FileBrowser (8082), AdGuard Home (3000, DNS 53) |
 | 202 | light-stack | 1 | 1024 MB | 8 GB | Vaultwarden (8000), Trilium (8083) |
@@ -20,8 +20,8 @@ One script, run on a Proxmox VE host, that creates 4 Debian LXC containers (Debi
 | RomM | `rommapp/romm:latest` + `mariadb:11` |
 | Nginx Proxy Manager | `jc21/nginx-proxy-manager:latest` |
 | Jellyfin | `jellyfin/jellyfin:latest` (includes jellyfin-ffmpeg) |
-| Navidrome | `deluan/navidrome:latest` (music from `/mnt/music` in CT 201) |
-| FileBrowser | `filebrowser/filebrowser:latest` (serves `/srv/files` in CT 201) |
+| Navidrome | `deluan/navidrome:latest` (music from `/mnt/music` in source-stack) |
+| FileBrowser | `filebrowser/filebrowser:latest` (serves `/srv/files` in source-stack) |
 | AdGuard Home | `adguard/adguardhome:latest` |
 | Vaultwarden | `vaultwarden/server:latest` |
 | Trilium | `triliumnext/trilium:latest` |
@@ -54,7 +54,7 @@ bash proxmox.sh self-update   # pull the newest version of this script from GitH
 bash proxmox.sh destroy       # remove the containers created by the script (and their data)
 ```
 
-Defaults: bridge `vmbr0`, storage `local-lvm`, container IDs 200–203. A default ID used by a guest this script did not create is skipped for the next free one. Rerunning `bash proxmox.sh` reuses the script's own containers and keeps existing `.env` files and data.
+Defaults: bridge `vmbr0`, storage `local-lvm`, preferred container IDs 200–203. Before creating anything the script resolves each ID: it reuses a CT only when that ID is already ours (listed in `/root/.homelab-script/ids` or the hostname matches the slot), finds an existing CT by hostname / the persistent `ct-map` file so the same app keeps the same CT on reruns, and if the preferred ID is taken by a different CT or VM it prints a warning like `CT 200 is in use by otherbox; using 205 for docker-stack` and takes a free ID from `pvesh get /cluster/nextid`. Override the preferred IDs with `CT_ID_DOCKER`, `CT_ID_SOURCE`, `CT_ID_LIGHT`, and `CT_ID_FORGE`. Rerunning `bash proxmox.sh` reuses the script's own containers and keeps existing `.env` files and data. `destroy` only removes recorded/our CTs.
 
 ## What happens during a run
 
