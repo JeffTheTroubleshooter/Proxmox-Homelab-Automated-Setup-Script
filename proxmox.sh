@@ -42,9 +42,6 @@ SCRIPT_REPO="Proxmox-Homelab-Automated-Setup-Script"
 # State kept on the host so destroy only touches what this script made.
 STATE_DIR="/root/.homelab-script"
 IDS_FILE="$STATE_DIR/ids"                 # lines: "ct 200" / "vm 100"
-HOST_PKGS_FILE="$STATE_DIR/host-packages" # host packages installed by older (build-on-host) versions
-RUST_MARKER="$STATE_DIR/rust-installed"   # present if an older version installed rustup
-BUILD_ROOT="/root/homelab-builds"         # build dir of older versions (cleanup only)
 GUEST_TAG="homelab-script"
 SKIP_IMMICH_ML=0
 SELF=""                                   # readable path to this script (set by resolve_self)
@@ -1121,35 +1118,6 @@ destroy_all() {
     if [[ -s "$tmp" ]]; then mv "$tmp" "$IDS_FILE"; else rm -f "$tmp" "$IDS_FILE"; fi
   fi
 
-  # leftovers from older versions of this script (SSH key, host build tools)
-  if [[ -f /root/.ssh/homelab_key ]]; then
-    rm -f /root/.ssh/homelab_key /root/.ssh/homelab_key.pub
-    ok "Removed old host SSH key."
-  fi
-  if [[ -s "$HOST_PKGS_FILE" || -f "$RUST_MARKER" ]]; then
-    echo "An older version of this script installed these host build packages:"
-    [[ -s "$HOST_PKGS_FILE" ]] && tr '\n' ' ' < "$HOST_PKGS_FILE" | fold -s -w 76 | sed 's/^/  /' && echo
-    [[ -f "$RUST_MARKER" ]] && echo "  rust (rustup in $HOME/.cargo)"
-    read -r -p "Remove them? [y/N]: " ans
-    if [[ "${ans,,}" == "y" ]]; then
-      if [[ -s "$HOST_PKGS_FILE" ]]; then
-        # shellcheck disable=SC2046
-        DEBIAN_FRONTEND=noninteractive apt-get remove -y $(cat "$HOST_PKGS_FILE") >/dev/null 2>&1 || \
-          warn "Some packages could not be removed (check with apt)."
-        rm -f "$HOST_PKGS_FILE"
-      fi
-      if [[ -f "$RUST_MARKER" && -x "$HOME/.cargo/bin/rustup" ]]; then
-        "$HOME/.cargo/bin/rustup" self uninstall -y >/dev/null 2>&1 || true
-        rm -rf "$HOME/.cargo" "$HOME/.rustup"
-      fi
-      rm -f "$RUST_MARKER"
-      ok "Host packages removed."
-    fi
-  fi
-  if [[ -d "$BUILD_ROOT" ]]; then
-    read -r -p "Remove the old host build directory $BUILD_ROOT? [y/N]: " ans
-    [[ "${ans,,}" == "y" ]] && rm -rf "$BUILD_ROOT" && ok "Removed $BUILD_ROOT"
-  fi
   ok "Done. Guests created by this script removed."
 }
 
