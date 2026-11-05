@@ -1313,7 +1313,22 @@ destroy_all() {
   fi
 
   (( ${#targets[@]} == 0 )) && info "No guests to remove."
-  local t
+  local t name
+  if (( ${#targets[@]} > 0 )); then
+    echo
+    echo "These guests will be PERMANENTLY deleted, with all their app data:"
+    for t in "${targets[@]}"; do
+      read -r type id <<< "$t"
+      if [[ "$type" == "ct" ]]; then name=$(pct config "$id" 2>/dev/null | awk '/^hostname:/ {print $2}')
+      else name=$(qm config "$id" 2>/dev/null | awk '/^name:/ {print $2}'); fi
+      printf '  %s %s  %s\n' "${type^^}" "$id" "${name:-?}"
+    done
+    read -rp "Type 'yes' to delete them: " ans
+    if [[ "${ans,,}" != "yes" ]]; then
+      info "Cancelled. Nothing was deleted."
+      return 0
+    fi
+  fi
   for t in "${targets[@]}"; do
     read -r type id <<< "$t"
     destroy_guest "$type" "$id" || keep+=("$t")
