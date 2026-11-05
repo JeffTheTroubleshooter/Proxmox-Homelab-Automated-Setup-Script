@@ -1,6 +1,6 @@
 # Proxmox Homelab Automated Setup Script
 
-> ⚠️ **Experimental.** This script is still being fixed and tested. Expect bugs, and try it on a test Proxmox host first.
+> ✅ **Tested and working** on Proxmox VE with Debian 13 containers. Nothing is installed on the Proxmox host itself: Docker and every app run only inside the LXC containers, set up with `pct exec` (no SSH). Change the default passwords after the first run.
 
 One script, run on a Proxmox VE host, that creates 4 Debian LXC containers (Debian 13 template, Debian 12 if 13 isn't available), installs Docker + the Compose plugin in each, runs every app from its **official Docker image**, health-checks them and prints every URL at the end. Nothing is compiled on the host or in the containers (except ForgePanel's small Python image, built from its own Dockerfile). Use [ForgePanel](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard) to see them all in one place.
 
