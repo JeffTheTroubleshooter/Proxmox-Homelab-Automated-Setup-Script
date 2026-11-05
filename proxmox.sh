@@ -671,6 +671,26 @@ push_file() {
 }
 ct_has_file() { pct exec "$1" -- test -s "$2" 2>/dev/null; }
 
+# Remote snippet (runs inside a CT in the compose dir): pull each image of the
+# compose project sequentially with backoff. HB_FORCE=1 re-pulls present images.
+PULL_FORCE=0
+PULL_IMAGES_SH='imgs=$(docker compose config --images | sort -u) || exit 1
+for img in $imgs; do
+  if [ "${HB_FORCE:-0}" != 1 ] && docker image inspect "$img" >/dev/null 2>&1; then
+    echo "already present, skipping pull: $img"; continue
+  fi
+  n=0
+  until echo "pulling $img" && docker pull -q "$img"; do
+    n=$((n+1))
+    if [ $n -ge 8 ]; then echo "giving up on $img after 8 attempts"; exit 1; fi
+    case $n in 1) w=20;; 2) w=40;; 3) w=60;; 4) w=90;; 5) w=120;; *) w=180;; esac
+    w=$((w + RANDOM % 15))
+    echo "pull of $img failed (rate limited?), waiting ${w}s (attempt $n/8)"
+    sleep $w
+  done
+  sleep 3
+done'
+
 # Write an app's files into CT, pull/build and start it, then make sure
 # none of its containers exited or is crash-looping.
 install_app() {
@@ -712,11 +732,14 @@ install_app() {
   esac
 
   step "$svc in CT $ctid: pull + start"
-  # Retry pulls: registries (ghcr.io, Docker Hub) can answer "toomanyrequests" for a short while.
-  local fetch="for i in 1 2 3 4 5; do docker compose --progress plain pull && break; [ \$i = 5 ] && exit 1; echo \"pull failed (attempt \$i/5), retrying in \$((i*30))s...\"; sleep \$((i*30)); done"
-  [[ "$app" == "forgepanel" ]] && fetch="docker compose --progress plain build --pull"
-  HB_CTID="$ctid" HB_KILL="docker compose" run_logged "$svc: pull (with retry) && up -d in CT $ctid" "$log" \
-    pct exec "$ctid" -- bash -c "cd $dir && docker compose config -q && $fetch && docker compose up -d --remove-orphans" \
+  # Pull images ONE AT A TIME (parallel pulls of Immich's several ghcr.io images
+  # burst the anonymous ghcr.io rate limit -> "toomanyrequests"). Each image is
+  # retried up to 8 times with growing waits + jitter; images already present
+  # locally are skipped (unless "update" mode) so a rerun resumes where it stopped.
+  local fetch="export COMPOSE_PARALLEL_LIMIT=1 HB_FORCE=$PULL_FORCE; $PULL_IMAGES_SH"
+  [[ "$app" == "forgepanel" ]] && fetch="COMPOSE_PARALLEL_LIMIT=1 docker compose --progress plain build --pull"
+  HB_CTID="$ctid" HB_KILL="docker" run_logged "$svc: pull images one by one (with retry) && up -d in CT $ctid" "$log" \
+    pct exec "$ctid" -- bash -c "cd $dir && docker compose config -q && $fetch && docker compose up -d --pull never --remove-orphans" \
     || fail "$svc did not start (docker compose failed in CT $ctid:$dir)." "$log"
 
   step "$svc in CT $ctid: containers running"
@@ -1021,6 +1044,7 @@ service_update() {
   echo "Updating apps in existing containers (pull newer images, recreate)"
   echo "=================================================================="
   check_host
+  PULL_FORCE=1   # update mode: re-pull even images already present
   local entry ctid hostname role
   for entry in "${CONTAINERS[@]}"; do
     IFS='|' read -r ctid hostname _ _ _ role _ <<< "$entry"
