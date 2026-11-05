@@ -27,7 +27,7 @@ One script, run on a Proxmox VE host, that creates 4 Debian LXC containers (Debi
 | Trilium | `triliumnext/trilium:latest` |
 | ForgePanel | built from [ForgePanel-Dashboard](https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard)'s Dockerfile, run with `--https` |
 
-Pin a version with an environment variable, e.g. `JELLYFIN_IMAGE=jellyfin/jellyfin:10.11.5 bash proxmox.sh`.
+Pin a version with an environment variable, e.g. `JELLYFIN_IMAGE=jellyfin/jellyfin:10.11.5 bash Proxmox_Homelab-Setup.sh`.
 
 Each app lives in `/opt/homelab/<app>/` inside its container (`docker-compose.yml`, `.env`, data folders). Every container uses `restart: always`.
 
@@ -39,7 +39,7 @@ All four containers are **privileged** with `nesting=1,keyctl=1` so Docker can u
 
 ## Standalone app installer repos
 
-The per-app repos below are **native installers** (from source or release tarballs, no Docker) for running an app directly on a machine. `proxmox.sh` no longer uses or embeds them.
+The per-app repos below are **native installers** (from source or release tarballs, no Docker) for running an app directly on a machine. `Proxmox_Homelab-Setup.sh` no longer uses or embeds them.
 
 - [Jellyfin](https://github.com/JeffTheTroubleshooter/Jellyfin-Automated-Setup-Script) · [Navidrome](https://github.com/JeffTheTroubleshooter/Navidrome-Automated-Setup-Script) · [FileBrowser](https://github.com/JeffTheTroubleshooter/FileBrowser-Automated-Setup-Script) · [AdGuard Home](https://github.com/JeffTheTroubleshooter/AdGuard-Home-Automated-Setup-Script) · [Vaultwarden](https://github.com/JeffTheTroubleshooter/Vaultwarden-Automated-Setup-Script) · [Trilium](https://github.com/JeffTheTroubleshooter/Trilium-Automated-Setup-Script) · [Immich](https://github.com/JeffTheTroubleshooter/Immich-Automated-Setup-Script) · [Nextcloud](https://github.com/JeffTheTroubleshooter/Nextcloud-Automated-Setup-Script) · [RomM](https://github.com/JeffTheTroubleshooter/RomM-Automated-Setup-Script) · [Nginx Proxy Manager](https://github.com/JeffTheTroubleshooter/Nginx-Proxy-Manager-Automated-Setup-Script)
 
@@ -48,13 +48,13 @@ The per-app repos below are **native installers** (from source or release tarbal
 On the Proxmox host, as root:
 
 ```bash
-bash proxmox.sh               # create + install everything
-bash proxmox.sh update        # pull newer images and recreate the apps in existing containers
-bash proxmox.sh self-update   # pull the newest version of this script from GitHub
-bash proxmox.sh destroy       # remove the containers created by the script (and their data)
+bash Proxmox_Homelab-Setup.sh               # create + install everything
+bash Proxmox_Homelab-Setup.sh update        # pull newer images and recreate the apps in existing containers
+bash Proxmox_Homelab-Setup.sh self-update   # pull the newest version of this script from GitHub
+bash Proxmox_Homelab-Setup.sh destroy       # remove the containers created by the script (and their data)
 ```
 
-Defaults: bridge `vmbr0`, storage `local-lvm`, preferred container IDs 200–203. Before creating anything the script resolves each ID: it reuses a CT only when that ID is already ours (listed in `/root/.homelab-script/ids` or the hostname matches the slot), finds an existing CT by hostname / the persistent `ct-map` file so the same app keeps the same CT on reruns, and if the preferred ID is taken by a different CT or VM it prints a warning like `CT 200 is in use by otherbox; using 205 for docker-stack` and takes a free ID from `pvesh get /cluster/nextid`. Override the preferred IDs with `CT_ID_DOCKER`, `CT_ID_SOURCE`, `CT_ID_LIGHT`, and `CT_ID_FORGE`. Rerunning `bash proxmox.sh` reuses the script's own containers and keeps existing `.env` files and data. `destroy` only removes recorded/our CTs.
+Defaults: bridge `vmbr0`, storage `local-lvm`, preferred container IDs 200–203. Before creating anything the script resolves each ID: it reuses a CT only when that ID is already ours (listed in `/root/.homelab-script/ids` or the hostname matches the slot), finds an existing CT by hostname / the persistent `ct-map` file so the same app keeps the same CT on reruns, and if the preferred ID is taken by a different CT or VM it prints a warning like `CT 200 is in use by otherbox; using 205 for docker-stack` and takes a free ID from `pvesh get /cluster/nextid`. Override the preferred IDs with `CT_ID_DOCKER`, `CT_ID_SOURCE`, `CT_ID_LIGHT`, and `CT_ID_FORGE`. Rerunning `bash Proxmox_Homelab-Setup.sh` reuses the script's own containers and keeps existing `.env` files and data. `destroy` only removes recorded/our CTs.
 
 ## What happens during a run
 
@@ -77,7 +77,7 @@ Every 30 seconds a long step prints its elapsed time and the last lines of its l
 ## Logins
 
 > ⚠️ **Every app gets the same default login. Change it right after the first login**, or set your own
-> before running: `HOMELAB_ADMIN_USER=me HOMELAB_ADMIN_PASS='At-Least-12-Chars' bash proxmox.sh`
+> before running: `HOMELAB_ADMIN_USER=me HOMELAB_ADMIN_PASS='At-Least-12-Chars' bash Proxmox_Homelab-Setup.sh`
 > (12+ characters, letters/digits/`._@+=-`).
 
 | App | URL | User | Password |
@@ -97,7 +97,7 @@ Every 30 seconds a long step prints its elapsed time and the last lines of its l
 Vaultwarden uses a self-signed certificate (the web vault refuses to run without HTTPS), so accept the browser warning once.
 The script prints this table with real IPs at the end of every run.
 
-Fix logins on an existing install (keeps data): `bash proxmox.sh reset-logins`. It resets the FileBrowser and Nextcloud
+Fix logins on an existing install (keeps data): `bash Proxmox_Homelab-Setup.sh reset-logins`. It resets the FileBrowser and Nextcloud
 admin passwords, redeploys Vaultwarden with HTTPS, and creates the Immich/Navidrome/Jellyfin admin if none exists yet.
 
 ## Security note
@@ -109,4 +109,4 @@ pct enter <ctid>
 passwd
 ```
 
-The containers are privileged so Docker runs at normal speed, which gives their services more access to the host than an unprivileged container. Keep the images updated (`bash proxmox.sh update`) and do not expose the apps to the internet without a reverse proxy and authentication.
+The containers are privileged so Docker runs at normal speed, which gives their services more access to the host than an unprivileged container. Keep the images updated (`bash Proxmox_Homelab-Setup.sh update`) and do not expose the apps to the internet without a reverse proxy and authentication.

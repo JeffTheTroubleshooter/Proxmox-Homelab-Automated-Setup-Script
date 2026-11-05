@@ -6,12 +6,12 @@
 # official Docker image inside the right one, health-checks them, and prints the URLs.
 #
 # Usage (on the Proxmox host):
-#   bash proxmox.sh            # create + install everything
-#   bash proxmox.sh update     # pull newer images and recreate the apps in existing CTs
-#   bash proxmox.sh reset-logins  # reset default logins + redeploy Vaultwarden (HTTPS), keeps data
-#   bash proxmox.sh destroy    # remove only guests this script created (tagged homelab-script)
-#   bash <(curl -fsSL <raw proxmox.sh URL>)   # run straight from GitHub
-#   curl -fsSL <raw proxmox.sh URL> | bash    # also works (re-downloads itself to /tmp)
+#   bash Proxmox_Homelab-Setup.sh            # create + install everything
+#   bash Proxmox_Homelab-Setup.sh update     # pull newer images and recreate the apps in existing CTs
+#   bash Proxmox_Homelab-Setup.sh reset-logins  # reset default logins + redeploy Vaultwarden (HTTPS), keeps data
+#   bash Proxmox_Homelab-Setup.sh destroy    # remove only guests this script created (tagged homelab-script)
+#   bash <(curl -fsSL <raw Proxmox_Homelab-Setup.sh URL>)   # run straight from GitHub
+#   curl -fsSL <raw Proxmox_Homelab-Setup.sh URL> | bash    # also works (re-downloads itself to /tmp)
 #
 # Containers (each: Debian, nesting=1,keyctl=1, Docker CE + compose plugin).
 # Preferred IDs below; if one is taken by a foreign CT/VM the script picks a free
@@ -51,7 +51,7 @@ GUEST_TAG="homelab-script"
 SKIP_IMMICH_ML=0
 SELF=""                                   # readable path to this script (set by resolve_self)
 APP_ROOT="/opt/homelab"                   # per-app compose dirs inside each CT
-END_MARKER='###END proxmox.sh'
+END_MARKER='###END Proxmox_Homelab-Setup.sh'
 
 PASSWORD="admin"   # root password of every CT
 
@@ -107,7 +107,7 @@ IMMICH_COMPOSE_URL="${IMMICH_COMPOSE_URL:-https://github.com/immich-app/immich/r
 FORGEPANEL_REPO="${FORGEPANEL_REPO:-https://github.com/JeffTheTroubleshooter/ForgePanel-Dashboard.git}"
 
 # Raw URL of this script on GitHub. Override with UPDATE_URL=... if the repo path differs.
-UPDATE_URL="${UPDATE_URL:-$REPO_BASE/$SCRIPT_REPO/main/proxmox.sh}"
+UPDATE_URL="${UPDATE_URL:-$REPO_BASE/$SCRIPT_REPO/main/Proxmox_Homelab-Setup.sh}"
 
 die()  { echo -e "\n\033[1;31mError:\033[0m $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*" >&2; }
@@ -227,7 +227,7 @@ resolve_self() {
     SELF="$0"
     return 0
   fi
-  local tmp="/tmp/homelab-proxmox.sh"
+  local tmp="/tmp/homelab-Proxmox_Homelab-Setup.sh"
   # bash <(curl ...): $0 is /dev/fd/NN. Try to save what is left of it.
   if [[ "$0" == /dev/fd/* || "$0" == /proc/self/fd/* ]] && [[ -r "$0" ]]; then
     cat "$0" > "$tmp" 2>/dev/null || true
@@ -237,11 +237,11 @@ resolve_self() {
     fi
   fi
   if [[ "${HOMELAB_REEXEC:-0}" == "1" ]]; then
-    die "Could not find a readable copy of this script. Download proxmox.sh and run: bash proxmox.sh"
+    die "Could not find a readable copy of this script. Download Proxmox_Homelab-Setup.sh and run: bash Proxmox_Homelab-Setup.sh"
   fi
-  info "Running from a pipe — downloading a full copy of proxmox.sh to $tmp ..."
+  info "Running from a pipe — downloading a full copy of Proxmox_Homelab-Setup.sh to $tmp ..."
   if ! curl -fsSL -o "$tmp" "$UPDATE_URL" || ! grep -qxF "$END_MARKER" "$tmp"; then
-    die "Could not download $UPDATE_URL (offline or GitHub unreachable?). Download proxmox.sh and run: bash proxmox.sh"
+    die "Could not download $UPDATE_URL (offline or GitHub unreachable?). Download Proxmox_Homelab-Setup.sh and run: bash Proxmox_Homelab-Setup.sh"
   fi
   chmod +x "$tmp"
   export HOMELAB_REEXEC=1 HOMELAB_PIPED=1
@@ -1416,4 +1416,4 @@ main() {
 
 main "$@"
 exit 0
-###END proxmox.sh
+###END Proxmox_Homelab-Setup.sh
