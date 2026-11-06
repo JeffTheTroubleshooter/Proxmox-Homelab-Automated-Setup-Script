@@ -47,14 +47,43 @@ The per-app repos below are **native installers** (from source or release tarbal
 
 On the Proxmox host, as root:
 
+| Command | What it does |
+|---------|--------------|
+| `bash Proxmox_Homelab-Setup.sh` | Create the four containers and install every app (default mode) |
+| `bash Proxmox_Homelab-Setup.sh update` | Pull newer images and recreate the apps in the existing containers |
+| `bash Proxmox_Homelab-Setup.sh reset-logins` | Reset default logins and redeploy Vaultwarden with HTTPS; keeps data |
+| `bash Proxmox_Homelab-Setup.sh self-update` | Pull the newest version of this script from GitHub |
+| `bash Proxmox_Homelab-Setup.sh destroy` | Remove only the containers this script created (alias: `remove`) |
+
+### Defaults
+
+| Setting | Value |
+|---------|-------|
+| Bridge | `vmbr0` |
+| Storage | `local-lvm` |
+| Saved IDs file | `/root/.homelab-script/ids` |
+
+### Containers
+
+| Container | Apps | Default ID | Override variable |
+|-----------|------|------------|-------------------|
+| `docker-stack` | Immich, Nextcloud, RomM, Nginx Proxy Manager | 200 | `CT_ID_DOCKER` |
+| `source-stack` | Jellyfin, Navidrome, FileBrowser, AdGuard Home | 201 | `CT_ID_SOURCE` |
+| `light-stack` | Vaultwarden, Trilium | 202 | `CT_ID_LIGHT` |
+| `forgepanel` | ForgePanel | 203 | `CT_ID_FORGE` |
+
+Example override:
+
 ```bash
-bash Proxmox_Homelab-Setup.sh               # create + install everything
-bash Proxmox_Homelab-Setup.sh update        # pull newer images and recreate the apps in existing containers
-bash Proxmox_Homelab-Setup.sh self-update   # pull the newest version of this script from GitHub
-bash Proxmox_Homelab-Setup.sh destroy       # remove the containers created by the script (and their data)
+CT_ID_DOCKER=205 CT_ID_SOURCE=206 bash Proxmox_Homelab-Setup.sh
 ```
 
-Defaults: bridge `vmbr0`, storage `local-lvm`, preferred container IDs 200–203. Before creating anything the script resolves each ID: it reuses a CT only when that ID is already ours (listed in `/root/.homelab-script/ids` or the hostname matches the slot), finds an existing CT by hostname / the persistent `ct-map` file so the same app keeps the same CT on reruns, and if the preferred ID is taken by a different CT or VM it prints a warning like `CT 200 is in use by otherbox; using 205 for docker-stack` and takes a free ID from `pvesh get /cluster/nextid`. Override the preferred IDs with `CT_ID_DOCKER`, `CT_ID_SOURCE`, `CT_ID_LIGHT`, and `CT_ID_FORGE`. Rerunning `bash Proxmox_Homelab-Setup.sh` reuses the script's own containers and keeps existing `.env` files and data. `destroy` only removes recorded/our CTs.
+### How container IDs are picked
+
+- Reuses IDs it created itself (listed in `/root/.homelab-script/ids`, or whose hostname matches the slot / `ct-map`).
+- Never modifies a CT or VM that belongs to you; if a preferred ID is taken it warns, e.g. `CT 200 is in use by otherbox; using 205 for docker-stack`, and takes the next free ID from `pvesh get /cluster/nextid`.
+- Reruns keep existing `.env` files and data.
+- `destroy` / `remove` only deletes this script's own containers, and only after you type `yes`.
 
 ## What happens during a run
 
